@@ -33,9 +33,12 @@ import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import io.ktor.http.ContentType
@@ -51,6 +54,12 @@ class TunnelServer {
     private var engine: ApplicationEngine? = null
     private val terminalManager = TerminalSessionManager()
     private val authService = TunnelAuthService.getInstance()
+    private val terminalSubscriptions = ConcurrentHashMap<String, MutableSet<String>>()
+    private val terminalLastOutput = ConcurrentHashMap<String, String>()
+    @Volatile
+    private var terminalStreamingJob: Job? = null
+    private val terminalStreamLines = 200
+    private val terminalStreamIntervalMs = 1000L
 
     val deviceRegistry = DeviceRegistry()
 
@@ -79,6 +88,7 @@ class TunnelServer {
             }
         }
         engine?.let { port = resolvePort(it) }
+        ensureTerminalStreaming()
         logger.info("Tunnel server started at ${serverInfo().wsUrl}")
     }
 
@@ -86,6 +96,8 @@ class TunnelServer {
         logger.info("Tunnel server stopping")
         engine?.stop(1000, 2000)
         engine = null
+        terminalStreamingJob?.cancel()
+        terminalStreamingJob = null
         scope.cancel()
     }
 
@@ -168,8 +180,25 @@ class TunnelServer {
                     sessions.remove(connectionId)
                     connectionContexts.remove(connectionId)
                     deviceRegistry.removeDevice(connectionId)
+                    removeSubscriptions(connectionId)
                     close()
                 }
+            }
+        }
+    }
+
+    private fun ensureTerminalStreaming() {
+        val existing = terminalStreamingJob
+        if (existing?.isActive == true) return
+        terminalStreamingJob = scope.launch {
+            while (true) {
+                try {
+                    pushTerminalUpdates()
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    logger.debug("Terminal streaming loop failed", error)
+                }
+                delay(terminalStreamIntervalMs)
             }
         }
     }
@@ -253,6 +282,24 @@ class TunnelServer {
                         )
                     }
                 }
+                "terminal_subscribe" -> {
+                    if (!ensureApproved(connectionId, session, context)) return
+                    val sessionId = payload.get("sessionId")?.asString?.trim().orEmpty()
+                    if (sessionId.isEmpty()) {
+                        sendJson(session, mapOf("type" to "terminal_error", "message" to "Missing sessionId."), connectionId)
+                        return
+                    }
+                    subscribeToSession(connectionId, session, sessionId)
+                }
+                "terminal_unsubscribe" -> {
+                    if (!ensureApproved(connectionId, session, context)) return
+                    val sessionId = payload.get("sessionId")?.asString?.trim().orEmpty()
+                    if (sessionId.isEmpty()) {
+                        sendJson(session, mapOf("type" to "terminal_error", "message" to "Missing sessionId."), connectionId)
+                        return
+                    }
+                    unsubscribeFromSession(connectionId, sessionId)
+                }
                 "close_terminal" -> {
                     if (!ensureApproved(connectionId, session, context)) return
                     val sessionId = payload.get("sessionId")?.asString?.trim().orEmpty()
@@ -323,6 +370,92 @@ class TunnelServer {
             connectionId,
         )
         return false
+    }
+
+    private fun subscribeToSession(
+        connectionId: String,
+        session: DefaultWebSocketSession,
+        sessionId: String,
+    ) {
+        val output = terminalManager.snapshot(sessionId, terminalStreamLines)
+        if (output == null) {
+            sendJson(session, mapOf("type" to "terminal_error", "message" to "Session not found."), connectionId)
+            return
+        }
+        val subscriptions = terminalSubscriptions.computeIfAbsent(connectionId) {
+            ConcurrentHashMap.newKeySet()
+        }
+        subscriptions.add(sessionId)
+        terminalLastOutput[sessionId] = output
+        sendJson(
+            session,
+            mapOf("type" to "terminal_output", "sessionId" to sessionId, "output" to output),
+            connectionId,
+        )
+    }
+
+    private fun unsubscribeFromSession(connectionId: String, sessionId: String) {
+        val subscriptions = terminalSubscriptions[connectionId] ?: return
+        subscriptions.remove(sessionId)
+        if (subscriptions.isEmpty()) {
+            terminalSubscriptions.remove(connectionId, subscriptions)
+        }
+        cleanupTerminalOutputCache(sessionId)
+    }
+
+    private fun removeSubscriptions(connectionId: String) {
+        val subscriptions = terminalSubscriptions.remove(connectionId) ?: return
+        subscriptions.forEach { sessionId ->
+            cleanupTerminalOutputCache(sessionId)
+        }
+    }
+
+    private fun cleanupTerminalOutputCache(sessionId: String) {
+        val stillSubscribed = terminalSubscriptions.values.any { it.contains(sessionId) }
+        if (!stillSubscribed) {
+            terminalLastOutput.remove(sessionId)
+        }
+    }
+
+    private fun pushTerminalUpdates() {
+        if (terminalSubscriptions.isEmpty()) return
+        val sessionIds = terminalSubscriptions.values.flatMap { it.toList() }.toSet()
+        if (sessionIds.isEmpty()) return
+        sessionIds.forEach { sessionId ->
+            val output = runCatching { terminalManager.snapshot(sessionId, terminalStreamLines) }.getOrNull()
+            if (output == null) {
+                removeSessionFromSubscriptions(sessionId)
+                return@forEach
+            }
+            val previous = terminalLastOutput[sessionId]
+            if (previous == output) return@forEach
+            terminalLastOutput[sessionId] = output
+            broadcastTerminalOutput(sessionId, output)
+        }
+    }
+
+    private fun removeSessionFromSubscriptions(sessionId: String) {
+        terminalSubscriptions.forEach { (connectionId, subscriptions) ->
+            subscriptions.remove(sessionId)
+            if (subscriptions.isEmpty()) {
+                terminalSubscriptions.remove(connectionId, subscriptions)
+            }
+        }
+        terminalLastOutput.remove(sessionId)
+    }
+
+    private fun broadcastTerminalOutput(sessionId: String, output: String) {
+        terminalSubscriptions.forEach { (connectionId, subscriptions) ->
+            if (!subscriptions.contains(sessionId)) return@forEach
+            val context = connectionContexts[connectionId]
+            if (context?.approved != true) return@forEach
+            val wsSession = sessions[connectionId] ?: return@forEach
+            sendJson(
+                wsSession,
+                mapOf("type" to "terminal_output", "sessionId" to sessionId, "output" to output),
+                connectionId,
+            )
+        }
     }
 
     private fun requestApproval(

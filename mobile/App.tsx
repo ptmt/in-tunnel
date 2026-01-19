@@ -24,6 +24,8 @@ type TerminalSession = {
   createdAt: string;
 };
 
+type AppTab = "terminal" | "builds" | "activity";
+
 type ServerMessage =
   | { type: "hello_ack"; deviceId: string }
   | { type: "approval_required"; message?: string }
@@ -57,6 +59,13 @@ const THEME = {
 };
 
 const initialServerUrl = "ws://localhost:8765/ws";
+const SESSION_POLL_MS = 6000;
+const STORAGE_KEYS = {
+  serverUrl: "tunnel_server_url",
+  pairingToken: "tunnel_pairing_token",
+  sessions: "tunnel_sessions",
+  activeSession: "tunnel_active_session",
+};
 
 export default function App() {
   const [fontsLoaded] = useFonts({
@@ -68,6 +77,7 @@ export default function App() {
   const [connection, setConnection] = useState<ConnectionState>("disconnected");
   const [deviceId, setDeviceId] = useState<string | null>(null);
   const [clientId, setClientId] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<AppTab>("terminal");
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [terminalOutputs, setTerminalOutputs] = useState<Record<string, string>>({});
@@ -88,6 +98,7 @@ export default function App() {
   const pairingTokenRef = useRef(pairingToken);
   const clientIdRef = useRef<string | null>(null);
   const appStateRef = useRef(AppState.currentState);
+  const settingsLoadedRef = useRef(false);
 
   const statusLabel = useMemo(() => {
     switch (connection) {
@@ -173,6 +184,18 @@ export default function App() {
   useEffect(() => {
     const previous = serverUrlRef.current;
     serverUrlRef.current = serverUrl;
+    if (settingsLoadedRef.current) {
+      const trimmed = serverUrl.trim();
+      if (!trimmed) {
+        AsyncStorage.removeItem(STORAGE_KEYS.serverUrl).catch(() => {
+          // Ignore storage errors.
+        });
+      } else {
+        AsyncStorage.setItem(STORAGE_KEYS.serverUrl, trimmed).catch(() => {
+          // Ignore storage errors.
+        });
+      }
+    }
     if (reconnectBlockedRef.current && previous !== serverUrl) {
       reconnectBlockedRef.current = null;
       blockedTokenRef.current = null;
@@ -192,6 +215,18 @@ export default function App() {
   useEffect(() => {
     const previous = pairingTokenRef.current;
     pairingTokenRef.current = pairingToken;
+    if (settingsLoadedRef.current) {
+      const trimmed = pairingToken.trim();
+      if (!trimmed) {
+        AsyncStorage.removeItem(STORAGE_KEYS.pairingToken).catch(() => {
+          // Ignore storage errors.
+        });
+      } else {
+        AsyncStorage.setItem(STORAGE_KEYS.pairingToken, trimmed).catch(() => {
+          // Ignore storage errors.
+        });
+      }
+    }
     if (
       reconnectBlockedRef.current &&
       blockedTokenRef.current !== null &&
@@ -216,6 +251,63 @@ export default function App() {
   useEffect(() => {
     clientIdRef.current = clientId;
   }, [clientId]);
+
+  useEffect(() => {
+    let active = true;
+    const loadSettings = async () => {
+      const entries = await AsyncStorage.multiGet([
+        STORAGE_KEYS.serverUrl,
+        STORAGE_KEYS.pairingToken,
+        STORAGE_KEYS.sessions,
+        STORAGE_KEYS.activeSession,
+      ]);
+      if (!active) return;
+      const stored = Object.fromEntries(entries);
+      settingsLoadedRef.current = true;
+      const storedUrl = stored[STORAGE_KEYS.serverUrl];
+      if (storedUrl) {
+        setServerUrl(storedUrl);
+      }
+      const storedToken = stored[STORAGE_KEYS.pairingToken];
+      if (storedToken) {
+        setPairingToken(storedToken);
+      }
+      const storedSessions = stored[STORAGE_KEYS.sessions];
+      if (storedSessions) {
+        try {
+          const parsed = JSON.parse(storedSessions);
+          if (Array.isArray(parsed)) {
+            const safeSessions = parsed.filter(
+              (item) =>
+                item &&
+                typeof item.id === "string" &&
+                typeof item.name === "string" &&
+                typeof item.workingDirectory === "string" &&
+                typeof item.createdAt === "string",
+            );
+            if (active) {
+              setSessions(safeSessions);
+            }
+          }
+        } catch {
+          // Ignore invalid cached sessions.
+        }
+      }
+      const storedActive = stored[STORAGE_KEYS.activeSession];
+      if (storedActive) {
+        setActiveSessionId(storedActive);
+      }
+    };
+    loadSettings().catch(() => {
+      // Ignore storage load errors.
+      if (active) {
+        settingsLoadedRef.current = true;
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -287,6 +379,9 @@ export default function App() {
       const prev = appStateRef.current;
       appStateRef.current = nextState;
       pushLog(`AppState: ${prev} -> ${nextState}`);
+      if (nextState === "active" && connectionRef.current === "connected") {
+        requestSessions();
+      }
     });
     return () => subscription.remove();
   }, []);
@@ -305,6 +400,34 @@ export default function App() {
     setActiveSessionId(first.id);
     requestSnapshot(first.id);
   }, [activeSessionId, sessions]);
+
+  useEffect(() => {
+    if (connection !== "connected") return;
+    const poll = setInterval(() => {
+      requestSessions();
+    }, SESSION_POLL_MS);
+    return () => clearInterval(poll);
+  }, [connection]);
+
+  useEffect(() => {
+    if (connection !== "connected") return;
+    AsyncStorage.setItem(STORAGE_KEYS.sessions, JSON.stringify(sessions)).catch(() => {
+      // Ignore storage errors.
+    });
+  }, [connection, sessions]);
+
+  useEffect(() => {
+    if (connection !== "connected") return;
+    if (!activeSessionId) {
+      AsyncStorage.removeItem(STORAGE_KEYS.activeSession).catch(() => {
+        // Ignore storage errors.
+      });
+      return;
+    }
+    AsyncStorage.setItem(STORAGE_KEYS.activeSession, activeSessionId).catch(() => {
+      // Ignore storage errors.
+    });
+  }, [activeSessionId, connection]);
 
   const normalizeUrl = (raw: string) => {
     const trimmed = raw.trim();
@@ -563,6 +686,8 @@ export default function App() {
   const activeSession = activeSessionId
     ? sessions.find((session) => session.id === activeSessionId) ?? null
     : null;
+  const emptyTerminalMessage =
+    sessions.length === 0 ? "No sessions reported yet." : "Select a session to view output.";
 
   if (!fontsLoaded) {
     return null;
@@ -580,60 +705,78 @@ export default function App() {
       <StatusBar style="light" />
       <SafeAreaView style={styles.safeArea}>
         <ScrollView contentContainerStyle={styles.content}>
-          <Text style={styles.title}>IntelliJ Tunnel</Text>
-          <Text style={styles.subtitle}>Pair to your IDE and keep builds in your pocket.</Text>
-
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Connection</Text>
-            <TextInput
-              style={styles.input}
-              value={serverUrl}
-              onChangeText={setServerUrl}
-              autoCapitalize="none"
-              autoCorrect={false}
-              placeholder="ws://host:8765/ws"
-              placeholderTextColor="rgba(248, 250, 252, 0.4)"
-            />
-            <TextInput
-              style={styles.input}
-              value={pairingToken}
-              onChangeText={setPairingToken}
-              autoCapitalize="none"
-              autoCorrect={false}
-              placeholder="pairing token"
-              placeholderTextColor="rgba(248, 250, 252, 0.4)"
-            />
-            <View style={styles.buttonRow}>
-              <Pressable
-                style={[styles.button, styles.buttonPrimary, connection !== "disconnected" && styles.buttonDisabled]}
-                onPress={connect}
-              >
-                <Text style={styles.buttonText}>Connect</Text>
-              </Pressable>
-              <Pressable style={[styles.button, styles.buttonGhost]} onPress={disconnect}>
-                <Text style={styles.buttonText}>Disconnect</Text>
-              </Pressable>
+          <View style={styles.headerRow}>
+            <View style={styles.headerText}>
+              <Text style={styles.title}>IntelliJ Tunnel</Text>
+              <Text style={styles.subtitle}>Pair to your IDE and keep builds in your pocket.</Text>
             </View>
-            <View style={styles.statusRow}>
-              <View style={[styles.statusDot, { backgroundColor: statusColor }]} />
-              <Text style={styles.statusText}>{statusLabel}</Text>
-              {deviceId ? <Text style={styles.statusMeta}>ID {deviceId.slice(0, 6)}</Text> : null}
-            </View>
+            {connection === "connected" ? <View style={styles.connectedIndicator} /> : null}
           </View>
 
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Terminal sessions</Text>
-            <View style={styles.buttonRow}>
-              <Pressable style={[styles.button, styles.buttonSecondary]} onPress={requestSessions}>
-                <Text style={styles.buttonText}>Refresh</Text>
-              </Pressable>
-              <Pressable style={[styles.button, styles.buttonSecondary]} onPress={startSession}>
-                <Text style={styles.buttonText}>New session</Text>
-              </Pressable>
+          {connection !== "connected" ? (
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>Connection</Text>
+              <TextInput
+                style={styles.input}
+                value={serverUrl}
+                onChangeText={setServerUrl}
+                autoCapitalize="none"
+                autoCorrect={false}
+                placeholder="ws://host:8765/ws"
+                placeholderTextColor="rgba(248, 250, 252, 0.4)"
+              />
+              <TextInput
+                style={styles.input}
+                value={pairingToken}
+                onChangeText={setPairingToken}
+                autoCapitalize="none"
+                autoCorrect={false}
+                placeholder="pairing token"
+                placeholderTextColor="rgba(248, 250, 252, 0.4)"
+              />
+              <View style={styles.buttonRow}>
+                <Pressable
+                  style={[styles.button, styles.buttonPrimary, connection !== "disconnected" && styles.buttonDisabled]}
+                  onPress={connect}
+                >
+                  <Text style={styles.buttonText}>Connect</Text>
+                </Pressable>
+                <Pressable style={[styles.button, styles.buttonGhost]} onPress={disconnect}>
+                  <Text style={styles.buttonText}>Disconnect</Text>
+                </Pressable>
+              </View>
+              <View style={styles.statusRow}>
+                <View style={[styles.statusDot, { backgroundColor: statusColor }]} />
+                <Text style={styles.statusText}>{statusLabel}</Text>
+                {deviceId ? <Text style={styles.statusMeta}>ID {deviceId.slice(0, 6)}</Text> : null}
+              </View>
             </View>
-            {sessions.length === 0 ? (
-              <Text style={styles.muted}>No sessions reported yet.</Text>
-            ) : (
+          ) : null}
+
+          <View style={styles.sectionTabs}>
+            <Pressable
+              style={[styles.sectionTab, activeTab === "terminal" && styles.sectionTabActive]}
+              onPress={() => setActiveTab("terminal")}
+            >
+              <Text style={styles.sectionTabText}>Terminal</Text>
+            </Pressable>
+            <Pressable
+              style={[styles.sectionTab, activeTab === "builds" && styles.sectionTabActive]}
+              onPress={() => setActiveTab("builds")}
+            >
+              <Text style={styles.sectionTabText}>Builds</Text>
+            </Pressable>
+            <Pressable
+              style={[styles.sectionTab, activeTab === "activity" && styles.sectionTabActive]}
+              onPress={() => setActiveTab("activity")}
+            >
+              <Text style={styles.sectionTabText}>Activity</Text>
+            </Pressable>
+          </View>
+
+          {activeTab === "terminal" ? (
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>Terminal</Text>
               <ScrollView
                 horizontal
                 showsHorizontalScrollIndicator={false}
@@ -656,77 +799,90 @@ export default function App() {
                     </Text>
                   </Pressable>
                 ))}
+                <Pressable style={[styles.tab, styles.tabAdd]} onPress={startSession}>
+                  <Text style={styles.tabAddText}>+</Text>
+                </Pressable>
               </ScrollView>
-            )}
-          </View>
-
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Terminal output</Text>
-            {activeSession ? (
-              <>
-                <View style={styles.outputHeader}>
-                  <View style={styles.outputHeaderMeta}>
-                    <Text style={styles.muted}>Session: {activeSession.name}</Text>
-                    <Text style={styles.outputPath} numberOfLines={1}>
-                      {activeSession.workingDirectory}
-                    </Text>
+              {activeSession ? (
+                <>
+                  <View style={styles.outputHeader}>
+                    <View style={styles.outputHeaderMeta}>
+                      <Text style={styles.muted}>Session: {activeSession.name}</Text>
+                      <Text style={styles.outputPath} numberOfLines={1}>
+                        {activeSession.workingDirectory}
+                      </Text>
+                    </View>
+                    <Pressable
+                      style={[styles.button, styles.buttonDangerOutline]}
+                      onPress={() => closeSession(activeSession.id)}
+                    >
+                      <Text style={styles.buttonText}>Close</Text>
+                    </Pressable>
+                  </View>
+                  <View style={styles.outputBox}>
+                    <Text style={styles.outputText}>{activeOutput || "No output yet."}</Text>
+                  </View>
+                  <View style={styles.commandRow}>
+                    <TextInput
+                      style={[styles.input, styles.commandInput]}
+                      value={command}
+                      onChangeText={setCommand}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      placeholder="Enter command"
+                      placeholderTextColor="rgba(248, 250, 252, 0.4)"
+                    />
+                    <View style={styles.micButton}>
+                      <View style={styles.micIcon}>
+                        <View style={styles.micHead} />
+                        <View style={styles.micStem} />
+                        <View style={styles.micBase} />
+                      </View>
+                    </View>
+                    <Pressable
+                      style={[styles.button, styles.buttonPrimary, !command.trim() && styles.buttonDisabled]}
+                      onPress={sendCommand}
+                    >
+                      <Text style={styles.buttonText}>Send</Text>
+                    </Pressable>
                   </View>
                   <Pressable
-                    style={[styles.button, styles.buttonDangerOutline]}
-                    onPress={() => closeSession(activeSession.id)}
+                    style={[styles.button, styles.buttonSecondary]}
+                    onPress={() => requestSnapshot(activeSession.id)}
                   >
-                    <Text style={styles.buttonText}>Close</Text>
+                    <Text style={styles.buttonText}>Refresh output</Text>
                   </Pressable>
-                </View>
-                <View style={styles.outputBox}>
-                  <Text style={styles.outputText}>{activeOutput || "No output yet."}</Text>
-                </View>
-                <View style={styles.commandRow}>
-                  <TextInput
-                    style={[styles.input, styles.commandInput]}
-                    value={command}
-                    onChangeText={setCommand}
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                    placeholder="Enter command"
-                    placeholderTextColor="rgba(248, 250, 252, 0.4)"
-                  />
-                  <Pressable
-                    style={[styles.button, styles.buttonPrimary, !command.trim() && styles.buttonDisabled]}
-                    onPress={sendCommand}
-                  >
-                    <Text style={styles.buttonText}>Send</Text>
-                  </Pressable>
-                </View>
-                <Pressable style={[styles.button, styles.buttonSecondary]} onPress={() => requestSnapshot(activeSession.id)}>
-                  <Text style={styles.buttonText}>Refresh output</Text>
-                </Pressable>
-              </>
-            ) : (
-              <Text style={styles.muted}>Select a session to view output.</Text>
-            )}
-          </View>
+                </>
+              ) : (
+                <Text style={styles.muted}>{emptyTerminalMessage}</Text>
+              )}
+            </View>
+          ) : null}
 
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Build</Text>
-            <Text style={styles.muted}>Status: {buildStatus}</Text>
-            <Pressable style={[styles.button, styles.buttonPrimary]} onPress={triggerBuild}>
-              <Text style={styles.buttonText}>Run build</Text>
-            </Pressable>
-          </View>
+          {activeTab === "builds" ? (
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>Builds</Text>
+              <Text style={styles.muted}>Status: {buildStatus}</Text>
+              <Pressable style={[styles.button, styles.buttonPrimary]} onPress={triggerBuild}>
+                <Text style={styles.buttonText}>Run build</Text>
+              </Pressable>
+            </View>
+          ) : null}
 
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Activity</Text>
-            {logs.length === 0 ? (
-              <Text style={styles.muted}>No activity yet.</Text>
-            ) : (
-              logs.map((entry, index) => (
-                <Text key={`${entry}-${index}`} style={styles.logEntry}>
-                  {entry}
-                </Text>
-              ))
-            )}
-          </View>
+          {activeTab === "activity" ? (
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>Activity</Text>
+              {logs.length === 0 ? (
+                <Text style={styles.muted}>No activity yet.</Text>
+              ) : (
+                logs.map((entry, index) => (
+                  <Text key={`${entry}-${index}`} style={styles.logEntry}>
+                    {entry}
+                  </Text>
+                ))
+              )}
+            </View>
+          ) : null}
         </ScrollView>
       </SafeAreaView>
     </LinearGradient>
@@ -744,6 +900,15 @@ const styles = StyleSheet.create({
     padding: 20,
     gap: 18,
   },
+  headerRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  headerText: {
+    flex: 1,
+  },
   title: {
     fontFamily: "SpaceGrotesk_700Bold",
     fontSize: 34,
@@ -755,6 +920,15 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: THEME.colors.muted,
     marginTop: 4,
+  },
+  connectedIndicator: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: THEME.colors.success,
+    borderWidth: 1,
+    borderColor: "rgba(248, 250, 252, 0.4)",
+    marginTop: 6,
   },
   card: {
     backgroundColor: THEME.colors.card,
@@ -768,6 +942,28 @@ const styles = StyleSheet.create({
     fontFamily: "SpaceGrotesk_700Bold",
     fontSize: 18,
     color: THEME.colors.text,
+  },
+  sectionTabs: {
+    flexDirection: "row",
+    gap: 10,
+  },
+  sectionTab: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: THEME.colors.cardBorder,
+    backgroundColor: "rgba(15, 23, 42, 0.65)",
+    alignItems: "center",
+  },
+  sectionTabActive: {
+    borderColor: THEME.colors.primary,
+    backgroundColor: "rgba(249, 115, 22, 0.2)",
+  },
+  sectionTabText: {
+    fontFamily: "SpaceGrotesk_700Bold",
+    color: THEME.colors.text,
+    fontSize: 14,
   },
   input: {
     backgroundColor: THEME.colors.input,
@@ -853,6 +1049,17 @@ const styles = StyleSheet.create({
     color: THEME.colors.text,
     fontSize: 13,
   },
+  tabAdd: {
+    minWidth: 52,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  tabAddText: {
+    fontFamily: "SpaceGrotesk_700Bold",
+    color: THEME.colors.text,
+    fontSize: 20,
+    lineHeight: 22,
+  },
   outputHeader: {
     flexDirection: "row",
     alignItems: "center",
@@ -893,6 +1100,39 @@ const styles = StyleSheet.create({
   },
   commandInput: {
     flex: 1,
+  },
+  micButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: THEME.colors.cardBorder,
+    backgroundColor: "rgba(15, 23, 42, 0.65)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  micIcon: {
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 2,
+  },
+  micHead: {
+    width: 12,
+    height: 16,
+    borderRadius: 6,
+    backgroundColor: THEME.colors.text,
+  },
+  micStem: {
+    width: 4,
+    height: 6,
+    borderRadius: 2,
+    backgroundColor: THEME.colors.text,
+  },
+  micBase: {
+    width: 14,
+    height: 3,
+    borderRadius: 2,
+    backgroundColor: THEME.colors.text,
   },
   logEntry: {
     fontFamily: "SpaceGrotesk_500Medium",

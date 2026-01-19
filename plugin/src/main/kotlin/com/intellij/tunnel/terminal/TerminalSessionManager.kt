@@ -9,6 +9,7 @@ import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.util.registry.Registry
 import com.intellij.terminal.JBTerminalWidget
 import com.intellij.terminal.ui.TerminalWidget
+import com.intellij.tunnel.settings.TunnelTerminalSettingsService
 import org.jetbrains.plugins.terminal.LocalBlockTerminalRunner
 import org.jetbrains.plugins.terminal.ShellTerminalWidget
 import org.jetbrains.plugins.terminal.TerminalToolWindowManager
@@ -252,9 +253,14 @@ class TerminalSessionManager {
         sessionId: String,
     ): ShellTerminalWidget {
         val terminalManager = TerminalToolWindowManager.getInstance(project)
+        val forceClassicTerminal = TunnelTerminalSettingsService.getInstance().isForceClassicTerminal()
         val registry = Registry.get(LocalBlockTerminalRunner.BLOCK_TERMINAL_REGISTRY)
         val wasBlockUiEnabled = registry.asBoolean()
-        if (wasBlockUiEnabled) {
+        val shouldDisableTemporarily = wasBlockUiEnabled && !forceClassicTerminal
+        if (wasBlockUiEnabled && forceClassicTerminal) {
+            logger.info("createSession: force classic terminal UI enabled id=$sessionId")
+            registry.setValue(false)
+        } else if (shouldDisableTemporarily) {
             logger.info("createSession: disabling new terminal UI id=$sessionId")
             registry.setValue(false)
         }
@@ -266,7 +272,7 @@ class TerminalSessionManager {
                     "New Terminal UI is enabled. Disable 'terminal.new.ui' to create tunnel terminal sessions.",
                 )
         } finally {
-            if (wasBlockUiEnabled) {
+            if (shouldDisableTemporarily) {
                 registry.setValue(true)
                 logger.info("createSession: restored new terminal UI flag id=$sessionId")
             }

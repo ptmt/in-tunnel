@@ -12,7 +12,12 @@
 
     <extensions defaultExtensionNs="com.intellij">
         <toolWindow id="Tunnel" anchor="right" factoryClass="com.intellij.tunnel.ui.TunnelToolWindowFactory" />
+        <applicationConfigurable
+            id="com.intellij.tunnel.settings"
+            displayName="Tunnel"
+            instance="com.intellij.tunnel.settings.TunnelSettingsConfigurable" />
         <applicationService serviceImplementation="com.intellij.tunnel.server.TunnelServerService" />
+        <applicationService serviceImplementation="com.intellij.tunnel.settings.TunnelTerminalSettingsService" />
         <postStartupActivity implementation="com.intellij.tunnel.startup.TunnelStartupActivity" />
     </extensions>
 </idea-plugin>

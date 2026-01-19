@@ -37,11 +37,15 @@ class TunnelToolWindowPanel : Disposable {
     private val deviceList = JBList(listModel)
     private val urlLabel = JBLabel("")
     private val qrLabel = JBLabel()
-    private val tokenCopyButton = JButton("Copy pairing token")
+    private val tokenCopyButton = JButton("Copy Token")
+    private val setupToggleButton = JButton("Show QR")
     private val exposureStatusLabel = JBLabel("")
     private val exposureButton = JButton("Start")
     private val exposureBox = ComboBox(ExposureMode.values())
+    private val connectionPanel = JBPanel<JBPanel<*>>()
     private var lastUrl: String? = null
+    private var showSetup = true
+    private var autoHideEnabled = true
     val component: JComponent
 
     init {
@@ -49,8 +53,6 @@ class TunnelToolWindowPanel : Disposable {
         header.layout = BoxLayout(header, BoxLayout.Y_AXIS)
         header.border = JBUI.Borders.empty(12)
 
-        val title = JBLabel("IntelliJ Tunnel")
-        title.font = title.font.deriveFont(title.font.size2D + 2f)
         val subtitle = JBLabel("Scan to connect")
         val qrImage = QrCodeRenderer.render(serverService.serverInfo().httpUrl, 220)
         qrLabel.icon = ImageIcon(qrImage)
@@ -59,6 +61,14 @@ class TunnelToolWindowPanel : Disposable {
         tokenCopyButton.border = JBUI.Borders.emptyTop(4)
         tokenCopyButton.addActionListener {
             CopyPasteManager.getInstance().setContents(StringSelection(authService.token()))
+            tokenCopyButton.text = "Copied"
+        }
+        setupToggleButton.addActionListener {
+            showSetup = !showSetup
+            if (showSetup) {
+                autoHideEnabled = false
+            }
+            updateSetupVisibility()
         }
 
         exposureBox.renderer = SimpleListCellRenderer.create("") { it.displayName }
@@ -85,14 +95,23 @@ class TunnelToolWindowPanel : Disposable {
         exposureRow.add(Box.createHorizontalStrut(8))
         exposureRow.add(exposureButton)
 
-        header.add(title)
-        header.add(subtitle)
-        header.add(qrLabel)
-        header.add(urlLabel)
-        header.add(tokenCopyButton)
-        header.add(exposureRow)
-        header.add(exposureStatusLabel)
-        header.add(JBLabel("Connected devices"))
+        connectionPanel.layout = BoxLayout(connectionPanel, BoxLayout.Y_AXIS)
+        connectionPanel.add(subtitle)
+        connectionPanel.add(qrLabel)
+        connectionPanel.add(urlLabel)
+        connectionPanel.add(tokenCopyButton)
+        connectionPanel.add(exposureRow)
+        connectionPanel.add(exposureStatusLabel)
+
+        val devicesHeader = JBPanel<JBPanel<*>>()
+        devicesHeader.layout = BoxLayout(devicesHeader, BoxLayout.X_AXIS)
+        devicesHeader.border = JBUI.Borders.emptyTop(8)
+        devicesHeader.add(JBLabel("Connected devices"))
+        devicesHeader.add(Box.createHorizontalGlue())
+        devicesHeader.add(setupToggleButton)
+
+        header.add(connectionPanel)
+        header.add(devicesHeader)
 
         deviceList.emptyText.text = "No devices connected"
         val scrollPane = ScrollPaneFactory.createScrollPane(deviceList, true)
@@ -104,6 +123,7 @@ class TunnelToolWindowPanel : Disposable {
 
         component = root
 
+        updateSetupVisibility()
         updateExposureUi(exposureService.state())
         exposureService.addListener(object : TunnelExposureListener {
             override fun stateChanged(state: ExposureState) {
@@ -120,6 +140,13 @@ class TunnelToolWindowPanel : Disposable {
                     devices.forEach { device ->
                         listModel.addElement("${device.name} - ${device.remoteAddress}")
                     }
+                    if (devices.isEmpty()) {
+                        autoHideEnabled = true
+                        showSetup = true
+                    } else if (autoHideEnabled) {
+                        showSetup = false
+                    }
+                    updateSetupVisibility()
                 }
             }
         }, this)
@@ -155,6 +182,13 @@ class TunnelToolWindowPanel : Disposable {
                 exposureButton.text = if (state.status == ExposureStatus.RUNNING) "Stop" else "Start"
             }
         }
+    }
+
+    private fun updateSetupVisibility() {
+        connectionPanel.isVisible = showSetup
+        setupToggleButton.text = if (showSetup) "Hide QR" else "Show QR"
+        connectionPanel.revalidate()
+        connectionPanel.repaint()
     }
 
     private fun formatStatus(label: String, state: ExposureState): String {

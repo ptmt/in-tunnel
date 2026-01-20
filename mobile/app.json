@@ -5,7 +5,11 @@
     "version": "0.1.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
-    "platforms": ["ios", "android", "web"],
+    "platforms": [
+      "ios",
+      "android",
+      "web"
+    ],
     "plugins": [
       [
         "react-native-audio-api",
@@ -13,15 +17,28 @@
           "iosBackgroundMode": true,
           "iosMicrophonePermission": "This app requires access to the microphone to record audio.",
           "androidPermissions": [
-          "android.permission.MODIFY_AUDIO_SETTINGS",
-          "android.permission.RECORD_AUDIO",
-          "android.permission.FOREGROUND_SERVICE",
+            "android.permission.MODIFY_AUDIO_SETTINGS",
+            "android.permission.RECORD_AUDIO",
+            "android.permission.FOREGROUND_SERVICE",
             "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
           ],
           "androidForegroundService": true,
-          "androidFSTypes": ["mediaPlayback"]
+          "androidFSTypes": [
+            "mediaPlayback"
+          ]
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "314eeb16-1be5-4242-b246-cf931f360bc9"
+      }
+    },
+    "ios": {
+      "bundleIdentifier": "com.potomushto.intunnel",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    }
   }
 }

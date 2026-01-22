@@ -3,10 +3,14 @@ import { LinearGradient } from "expo-linear-gradient";
 import { StatusBar } from "expo-status-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { CameraView, useCameraPermissions } from "expo-camera";
 import {
   Platform,
   AppState,
   Modal,
+  LayoutChangeEvent,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -67,11 +71,14 @@ export default function App() {
     SpaceGrotesk_500Medium,
     SpaceGrotesk_700Bold,
   });
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [serverUrl, setServerUrl] = useState(initialServerUrl);
   const [pairingToken, setPairingToken] = useState<string>("");
   const [connection, setConnection] = useState<ConnectionState>("disconnected");
   const [connectionHistory, setConnectionHistory] = useState<ConnectionHistoryItem[]>([]);
   const [connectionModalVisible, setConnectionModalVisible] = useState(false);
+  const [scannerVisible, setScannerVisible] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
   const [settingsReady, setSettingsReady] = useState(false);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [reconnectPending, setReconnectPending] = useState(false);
@@ -93,6 +100,12 @@ export default function App() {
   const blockedTokenRef = useRef<string | null>(null);
   const blockNotifiedRef = useRef(false);
   const pendingSendsRef = useRef<Record<string, unknown>[]>([]);
+  const scanLockRef = useRef(false);
+  const scanResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const outputScrollRef = useRef<ScrollView | null>(null);
+  const autoScrollEnabledRef = useRef(true);
+  const outputContentHeightRef = useRef(0);
+  const outputLayoutHeightRef = useRef(0);
   const connectionRef = useRef<ConnectionState>("disconnected");
   const serverUrlRef = useRef(serverUrl);
   const pairingTokenRef = useRef(pairingToken);
@@ -191,6 +204,24 @@ export default function App() {
     connectionRef.current = next;
     setConnection(next);
   };
+
+  useEffect(() => {
+    if (scannerVisible) return;
+    if (scanResetTimerRef.current) {
+      clearTimeout(scanResetTimerRef.current);
+      scanResetTimerRef.current = null;
+    }
+    scanLockRef.current = false;
+    setScanError(null);
+  }, [scannerVisible]);
+
+  useEffect(() => {
+    return () => {
+      if (scanResetTimerRef.current) {
+        clearTimeout(scanResetTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const previous = serverUrlRef.current;
@@ -563,6 +594,138 @@ export default function App() {
     }
   };
 
+  const parseQrPayload = (payload: string) => {
+    const trimmed = payload.trim();
+    if (!trimmed) return null;
+
+    const fromUrl = (value: string) => {
+      try {
+        const normalizedValue = value
+          .replace(/^intellij-tunnel:\/\//i, "https://")
+          .replace(/^tunnel:\/\//i, "https://");
+        const url = new URL(normalizedValue);
+        const token =
+          url.searchParams.get("token") ??
+          url.searchParams.get("pairingToken") ??
+          url.searchParams.get("pairing_token");
+        const serverUrl = `${url.protocol}//${url.host}${url.pathname}`;
+        return { serverUrl, pairingToken: token ?? undefined };
+      } catch {
+        return null;
+      }
+    };
+
+    if (trimmed.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+        if (parsed && typeof parsed === "object") {
+          const rawUrl =
+            typeof parsed.serverUrl === "string"
+              ? parsed.serverUrl
+              : typeof parsed.url === "string"
+                ? parsed.url
+                : typeof parsed.server === "string"
+                  ? parsed.server
+                  : typeof parsed.host === "string"
+                    ? parsed.host
+                    : undefined;
+          const rawToken =
+            typeof parsed.pairingToken === "string"
+              ? parsed.pairingToken
+              : typeof parsed.token === "string"
+                ? parsed.token
+                : typeof parsed["pairing_token"] === "string"
+                  ? parsed["pairing_token"]
+                  : undefined;
+          const parsedUrl = rawUrl ? fromUrl(rawUrl) : null;
+          const serverUrl = parsedUrl?.serverUrl ?? rawUrl;
+          const pairingToken = rawToken ?? parsedUrl?.pairingToken;
+          if (serverUrl || pairingToken) {
+            return { serverUrl, pairingToken };
+          }
+        }
+      } catch {
+        // Ignore malformed JSON payloads.
+      }
+    }
+
+    const parsedUrl = fromUrl(trimmed);
+    if (parsedUrl && (parsedUrl.serverUrl || parsedUrl.pairingToken)) {
+      return parsedUrl;
+    }
+
+    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) && /[./:]/.test(trimmed)) {
+      const hostUrl = fromUrl(`http://${trimmed}`);
+      if (hostUrl && (hostUrl.serverUrl || hostUrl.pairingToken)) {
+        return hostUrl;
+      }
+    }
+
+    const parts = trimmed.split(/\s+/);
+    if (parts.length >= 2 && /[./:]/.test(parts[0])) {
+      return { serverUrl: parts[0], pairingToken: parts[1] };
+    }
+
+    return null;
+  };
+
+  const applyQrPayload = (payload: string) => {
+    const parsed = parseQrPayload(payload);
+    if (!parsed) {
+      setScanError("Unrecognized QR code. Expected a URL or JSON payload.");
+      return false;
+    }
+    let applied = false;
+    if (parsed.serverUrl) {
+      setServerUrl(normalizeUrl(parsed.serverUrl));
+      applied = true;
+    }
+    if (parsed.pairingToken) {
+      setPairingToken(parsed.pairingToken.trim());
+      applied = true;
+    }
+    if (!applied) {
+      setScanError("QR code did not include a URL or token.");
+      return false;
+    }
+    setScanError(null);
+    return true;
+  };
+
+  const resetScannerError = () => {
+    if (scanResetTimerRef.current) {
+      clearTimeout(scanResetTimerRef.current);
+      scanResetTimerRef.current = null;
+    }
+    scanLockRef.current = false;
+    setScanError(null);
+  };
+
+  const openScanner = () => {
+    setScannerVisible(true);
+    if (!cameraPermission?.granted) {
+      requestCameraPermission().catch(() => {
+        // Ignore permission errors.
+      });
+    }
+  };
+
+  const handleQrScanned = ({ data }: { data: string }) => {
+    if (scanLockRef.current) return;
+    scanLockRef.current = true;
+    const applied = applyQrPayload(data);
+    if (applied) {
+      setScannerVisible(false);
+      return;
+    }
+    if (scanResetTimerRef.current) {
+      clearTimeout(scanResetTimerRef.current);
+    }
+    scanResetTimerRef.current = setTimeout(() => {
+      scanLockRef.current = false;
+    }, 1200);
+  };
+
   const isInvalidTokenText = (value?: string | null) => {
     if (!value) return false;
     const lower = value.toLowerCase();
@@ -581,6 +744,39 @@ export default function App() {
       .split(/\r?\n/)
       .filter((line) => !line.includes(removeNeedle))
       .join("\n");
+  };
+
+  const scrollOutputToEnd = (animated: boolean) => {
+    const scrollView = outputScrollRef.current;
+    if (!scrollView) return;
+    const contentHeight = outputContentHeightRef.current;
+    const layoutHeight = outputLayoutHeightRef.current;
+    if (!contentHeight || !layoutHeight) {
+      scrollView.scrollToEnd({ animated });
+      return;
+    }
+    const y = Math.max(0, contentHeight - layoutHeight);
+    scrollView.scrollTo({ y, animated });
+  };
+
+  const handleOutputContentSizeChange = (_width: number, height: number) => {
+    outputContentHeightRef.current = height;
+    if (!autoScrollEnabledRef.current) return;
+    scrollOutputToEnd(true);
+  };
+
+  const handleOutputLayout = (event: LayoutChangeEvent) => {
+    outputLayoutHeightRef.current = event.nativeEvent.layout.height;
+    if (!autoScrollEnabledRef.current) return;
+    scrollOutputToEnd(false);
+  };
+
+  const handleOutputScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+    const paddingToBottom = 24;
+    const atBottom =
+      contentOffset.y + layoutMeasurement.height >= contentSize.height - paddingToBottom;
+    autoScrollEnabledRef.current = atBottom;
   };
 
   const updateConnectionHistory = (rawUrl: string, rawToken: string) => {
@@ -932,6 +1128,13 @@ export default function App() {
     return "Select a session to view output.";
   })();
 
+  useEffect(() => {
+    autoScrollEnabledRef.current = true;
+    if (displayActiveSessionId) {
+      requestAnimationFrame(() => scrollOutputToEnd(false));
+    }
+  }, [displayActiveSessionId]);
+
   if (!fontsLoaded) {
     return null;
   }
@@ -981,15 +1184,24 @@ export default function App() {
                 {shouldForceConnectionModal ? (
                   <Text style={styles.modalHint}>Add a connection to get started.</Text>
                 ) : null}
-                <TextInput
-                  style={styles.input}
-                  value={serverUrl}
-                  onChangeText={setServerUrl}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  placeholder="ws://host:8765/ws"
-                  placeholderTextColor="rgba(248, 250, 252, 0.4)"
-                />
+                <View style={styles.urlRow}>
+                  <TextInput
+                    style={[styles.input, styles.urlInput]}
+                    value={serverUrl}
+                    onChangeText={setServerUrl}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    placeholder="ws://host:8765/ws"
+                    placeholderTextColor="rgba(248, 250, 252, 0.4)"
+                  />
+                  <Pressable
+                    style={styles.qrButton}
+                    onPress={openScanner}
+                    accessibilityLabel="Scan QR code"
+                  >
+                    <Text style={styles.qrButtonText}>QR</Text>
+                  </Pressable>
+                </View>
                 <TextInput
                   style={styles.input}
                   value={pairingToken}
@@ -1054,6 +1266,80 @@ export default function App() {
           </SafeAreaView>
         </LinearGradient>
       </Modal>
+      <Modal
+        visible={scannerVisible}
+        animationType="slide"
+        presentationStyle="fullScreen"
+        onRequestClose={() => setScannerVisible(false)}
+      >
+        <LinearGradient
+          colors={[
+            THEME.colors.backgroundTop,
+            THEME.colors.backgroundMid,
+            THEME.colors.backgroundBottom,
+          ]}
+          style={styles.modalContainer}
+        >
+          <SafeAreaView style={styles.modalSafeArea}>
+            <View style={styles.scannerHeader}>
+              <Text style={styles.cardTitle}>Scan QR code</Text>
+              <Pressable
+                style={styles.modalCloseButton}
+                onPress={() => setScannerVisible(false)}
+              >
+                <Text style={styles.modalCloseText}>Close</Text>
+              </Pressable>
+            </View>
+            <View style={styles.scannerBody}>
+              {cameraPermission?.granted ? (
+                <>
+                  <View style={styles.scannerPreview}>
+                    <CameraView
+                      style={styles.scannerCamera}
+                      barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
+                      onBarcodeScanned={handleQrScanned}
+                    />
+                    <View pointerEvents="none" style={styles.scannerFrameOverlay}>
+                      <View style={styles.scannerFrame} />
+                    </View>
+                  </View>
+                  <View style={styles.scannerFooter}>
+                    <Text style={styles.scannerHint}>Align the QR code inside the frame.</Text>
+                    {scanError ? <Text style={styles.scanError}>{scanError}</Text> : null}
+                    {scanError ? (
+                      <Pressable
+                        style={[styles.button, styles.buttonSecondary]}
+                        onPress={resetScannerError}
+                      >
+                        <Text style={styles.buttonText}>Try again</Text>
+                      </Pressable>
+                    ) : null}
+                  </View>
+                </>
+              ) : (
+                <View style={styles.scannerPermission}>
+                  <Text style={styles.cardTitle}>Camera access</Text>
+                  <Text style={styles.muted}>We need permission to scan QR codes.</Text>
+                  {cameraPermission?.canAskAgain !== false ? (
+                    <Pressable
+                      style={[styles.button, styles.buttonPrimary]}
+                      onPress={() => {
+                        requestCameraPermission().catch(() => {
+                          // Ignore permission errors.
+                        });
+                      }}
+                    >
+                      <Text style={styles.buttonText}>Allow camera</Text>
+                    </Pressable>
+                  ) : (
+                    <Text style={styles.scanError}>Enable camera access in Settings.</Text>
+                  )}
+                </View>
+              )}
+            </View>
+          </SafeAreaView>
+        </LinearGradient>
+      </Modal>
       <SafeAreaView style={styles.safeArea}>
         <View style={styles.screen}>
           <ScrollView contentContainerStyle={styles.content}>
@@ -1107,26 +1393,15 @@ export default function App() {
                 ) : null}
                 {activeSession && !isLoading ? (
                   <>
-                    <View style={styles.outputHeader}>
-                      <View style={styles.outputHeaderMeta}>
-                        <Text style={styles.muted}>Session: {activeSession.name}</Text>
-                        <Text style={styles.outputPath} numberOfLines={1}>
-                          {activeSession.workingDirectory}
-                        </Text>
-                      </View>
-                      {canInteract ? (
-                        <Pressable
-                          style={[styles.button, styles.buttonDangerOutline]}
-                          onPress={() => closeSession(activeSession.id)}
-                        >
-                          <Text style={styles.buttonText}>Close</Text>
-                        </Pressable>
-                      ) : null}
-                    </View>
                     <ScrollView
+                      ref={outputScrollRef}
                       style={styles.outputScroll}
                       contentContainerStyle={styles.outputScrollContent}
                       nestedScrollEnabled
+                      onScroll={handleOutputScroll}
+                      onContentSizeChange={handleOutputContentSizeChange}
+                      onLayout={handleOutputLayout}
+                      scrollEventThrottle={16}
                     >
                       <Text style={styles.outputText}>{displayOutput || "No output yet."}</Text>
                     </ScrollView>
@@ -1168,12 +1443,20 @@ export default function App() {
                       </Pressable>
                     </View>
                     {canInteract ? (
-                      <Pressable
-                        style={[styles.button, styles.buttonSecondary]}
-                        onPress={() => requestSnapshot(activeSession.id)}
-                      >
-                        <Text style={styles.buttonText}>Refresh output</Text>
-                      </Pressable>
+                      <View style={styles.sessionActionRow}>
+                        <Pressable
+                          style={[styles.button, styles.buttonDangerOutline, styles.sessionActionButton]}
+                          onPress={() => closeSession(activeSession.id)}
+                        >
+                          <Text style={styles.buttonText}>Close</Text>
+                        </Pressable>
+                        <Pressable
+                          style={[styles.button, styles.buttonSecondary, styles.sessionActionButton]}
+                          onPress={() => requestSnapshot(activeSession.id)}
+                        >
+                          <Text style={styles.buttonText}>Refresh output</Text>
+                        </Pressable>
+                      </View>
                     ) : null}
                   </>
                 ) : (
@@ -1404,6 +1687,90 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     fontFamily: "SpaceGrotesk_500Medium",
   },
+  urlRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  urlInput: {
+    flex: 1,
+  },
+  qrButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: THEME.colors.cardBorder,
+    backgroundColor: "rgba(15, 23, 42, 0.65)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  qrButtonText: {
+    fontFamily: "SpaceGrotesk_700Bold",
+    color: THEME.colors.text,
+    fontSize: 11,
+    letterSpacing: 1,
+  },
+  scannerHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    paddingBottom: 12,
+  },
+  scannerBody: {
+    flex: 1,
+    paddingHorizontal: 20,
+    paddingBottom: 24,
+    gap: 16,
+  },
+  scannerPreview: {
+    flex: 1,
+    borderRadius: 20,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: THEME.colors.cardBorder,
+    backgroundColor: "rgba(15, 23, 42, 0.65)",
+  },
+  scannerCamera: {
+    flex: 1,
+  },
+  scannerFrameOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  scannerFrame: {
+    width: "70%",
+    aspectRatio: 1,
+    borderRadius: 18,
+    borderWidth: 2,
+    borderColor: "rgba(248, 250, 252, 0.7)",
+  },
+  scannerFooter: {
+    gap: 10,
+    alignItems: "center",
+  },
+  scannerHint: {
+    fontFamily: "SpaceGrotesk_500Medium",
+    color: THEME.colors.text,
+    fontSize: 13,
+    textAlign: "center",
+  },
+  scanError: {
+    fontFamily: "SpaceGrotesk_500Medium",
+    color: THEME.colors.danger,
+    fontSize: 12,
+    textAlign: "center",
+  },
+  scannerPermission: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 12,
+    paddingHorizontal: 20,
+  },
   historyList: {
     gap: 10,
   },
@@ -1534,21 +1901,6 @@ const styles = StyleSheet.create({
     fontSize: 20,
     lineHeight: 22,
   },
-  outputHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 12,
-  },
-  outputHeaderMeta: {
-    flex: 1,
-    gap: 2,
-  },
-  outputPath: {
-    fontFamily: "SpaceGrotesk_500Medium",
-    color: THEME.colors.muted,
-    fontSize: 12,
-  },
   outputScroll: {
     maxHeight: 240,
   },
@@ -1590,6 +1942,15 @@ const styles = StyleSheet.create({
   },
   commandButtonDisabled: {
     opacity: 0.5,
+  },
+  sessionActionRow: {
+    flexDirection: "row",
+    gap: 10,
+    flexWrap: "wrap",
+  },
+  sessionActionButton: {
+    flex: 1,
+    alignItems: "center",
   },
   bottomBar: {
     paddingHorizontal: 16,

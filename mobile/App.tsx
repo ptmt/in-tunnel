@@ -19,7 +19,7 @@ import {
   TextInput,
   View,
 } from "react-native";
-import AudioTranscription from "./AudioTranscription";
+import useAudioTranscription from "./useAudioTranscription";
 import { THEME } from "./theme";
 
 type ConnectionState = "disconnected" | "connecting" | "connected";
@@ -31,6 +31,26 @@ type TerminalSession = {
   createdAt: string;
 };
 
+type RunConfigurationItem = {
+  id: string;
+  name: string;
+  type: string;
+  folder?: string | null;
+  temporary?: boolean;
+  shared?: boolean;
+};
+
+type IdeProgressTask = {
+  id: string;
+  kind: "indexing" | "build";
+  title: string;
+  text?: string | null;
+  fraction?: number | null;
+  indeterminate?: boolean;
+  projectName?: string | null;
+  startedAt?: string | null;
+};
+
 type ConnectionHistoryItem = {
   id: string;
   serverUrl: string;
@@ -38,7 +58,7 @@ type ConnectionHistoryItem = {
   lastUsed: string;
 };
 
-type AppTab = "terminal" | "transcribe" | "builds" | "activity";
+type AppTab = "terminal" | "builds" | "activity";
 
 type ServerMessage =
   | { type: "hello_ack"; deviceId: string }
@@ -51,7 +71,10 @@ type ServerMessage =
   | { type: "terminal_output"; sessionId: string; output: string }
   | { type: "terminal_closed"; sessionId: string }
   | { type: "terminal_error"; message: string }
+  | { type: "ide_progress"; tasks: IdeProgressTask[] }
   | { type: "build_status"; status: string; message?: string }
+  | { type: "run_configurations"; items: RunConfigurationItem[] }
+  | { type: "run_configuration_status"; status: string; id: string; name?: string; message?: string }
   | { type: "error"; message?: string; code?: string };
 
 const initialServerUrl = "ws://localhost:8765/ws";
@@ -64,6 +87,11 @@ const STORAGE_KEYS = {
   activeSession: "tunnel_active_session",
   connectionHistory: "tunnel_connection_history",
   terminalOutputs: "tunnel_terminal_outputs",
+};
+
+const formatPercent = (value: number | null | undefined) => {
+  if (typeof value !== "number" || Number.isNaN(value)) return "0%";
+  return `${Math.round(value * 100)}%`;
 };
 
 export default function App() {
@@ -90,7 +118,10 @@ export default function App() {
   const [terminalOutputs, setTerminalOutputs] = useState<Record<string, string>>({});
   const [command, setCommand] = useState<string>("");
   const [buildStatus, setBuildStatus] = useState<string>("idle");
+  const [ideProgress, setIdeProgress] = useState<IdeProgressTask[]>([]);
+  const [runConfigurations, setRunConfigurations] = useState<RunConfigurationItem[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
+  const transcription = useAudioTranscription();
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptsRef = useRef(0);
@@ -103,6 +134,7 @@ export default function App() {
   const scanLockRef = useRef(false);
   const scanResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const outputScrollRef = useRef<ScrollView | null>(null);
+  const transcriptionBaseRef = useRef("");
   const autoScrollEnabledRef = useRef(true);
   const outputContentHeightRef = useRef(0);
   const outputLayoutHeightRef = useRef(0);
@@ -145,6 +177,34 @@ export default function App() {
   const hasCachedSessions = sessions.length > 0;
   const showCachedContent = connection === "disconnected" && hasCachedSessions;
   const isLoading = connection === "connecting" || (canInteract && !sessionsLoaded);
+
+  const transcriptionText = useMemo(() => {
+    if (transcription.committedText && transcription.partialText) {
+      return `${transcription.committedText} ${transcription.partialText}`;
+    }
+    return transcription.committedText || transcription.partialText;
+  }, [transcription.committedText, transcription.partialText]);
+
+  useEffect(() => {
+    if (transcription.isRecording) {
+      transcriptionBaseRef.current = command.trim();
+      return;
+    }
+    transcriptionBaseRef.current = "";
+  }, [transcription.isRecording]);
+
+  useEffect(() => {
+    if (!transcription.isRecording) return;
+    const base = transcriptionBaseRef.current;
+    const next = base
+      ? transcriptionText
+        ? `${base} ${transcriptionText}`
+        : base
+      : transcriptionText;
+    if (next !== command) {
+      setCommand(next);
+    }
+  }, [transcription.isRecording, transcriptionText]);
 
   const pushLog = (entry: string) => {
     setLogs((prev) => [entry, ...prev].slice(0, 40));
@@ -195,6 +255,14 @@ export default function App() {
     }
     if (message.type === "build_status") {
       pushLog(`ws <= build_status (${message.status})`);
+      return;
+    }
+    if (message.type === "run_configurations") {
+      pushLog(`ws <= run_configurations (${message.items.length})`);
+      return;
+    }
+    if (message.type === "run_configuration_status") {
+      pushLog(`ws <= run_configuration_status (${message.status})`);
       return;
     }
     pushLog(`ws <= ${message.type}`);
@@ -929,10 +997,16 @@ export default function App() {
       const deviceName = `${Platform.OS}-mobile`;
       const helloPayload = { type: "hello", deviceName, deviceId: clientIdRef.current };
       const listPayload = { type: "list_sessions" };
+      const runConfigsPayload = { type: "list_run_configurations" };
+      const progressPayload = { type: "list_ide_progress" };
       socket.send(JSON.stringify(helloPayload));
       logOutbound(helloPayload, false);
       socket.send(JSON.stringify(listPayload));
       logOutbound(listPayload, false);
+      socket.send(JSON.stringify(runConfigsPayload));
+      logOutbound(runConfigsPayload, false);
+      socket.send(JSON.stringify(progressPayload));
+      logOutbound(progressPayload, false);
       flushPending();
       pushLog("Socket connected");
     };
@@ -974,10 +1048,21 @@ export default function App() {
           });
           setActiveSessionId((current) => (current === message.sessionId ? null : current));
           setSessionsLoaded(true);
+        } else if (message.type === "ide_progress") {
+          setIdeProgress(message.tasks ?? []);
         } else if (message.type === "build_status") {
           setBuildStatus(message.status);
           if (message.message) {
             pushLog(`Build: ${message.message}`);
+          }
+        } else if (message.type === "run_configurations") {
+          setRunConfigurations(message.items ?? []);
+        } else if (message.type === "run_configuration_status") {
+          const label = message.name ?? message.id || "Unknown configuration";
+          if (message.status === "started") {
+            pushLog(`Run started: ${label}`);
+          } else {
+            pushLog(`Run ${message.status}: ${label}${message.message ? ` (${message.message})` : ""}`);
           }
         } else if (message.type === "terminal_error") {
           pushLog(`Terminal: ${message.message}`);
@@ -1000,6 +1085,8 @@ export default function App() {
       setDeviceId(null);
       subscribedSessionRef.current = null;
       setSessionsLoaded(false);
+      setRunConfigurations([]);
+      setIdeProgress([]);
       const reason = event.reason ? `: ${event.reason}` : "";
       pushLog(`Socket disconnected (${event.code}${reason})`);
       if (isInvalidTokenText(event.reason)) {
@@ -1029,6 +1116,9 @@ export default function App() {
     updateConnection("disconnected");
     subscribedSessionRef.current = null;
     setSessionsLoaded(false);
+    setRunConfigurations([]);
+    setIdeProgress([]);
+    setBuildStatus("idle");
   };
 
   const connectWithHistory = (item: ConnectionHistoryItem) => {
@@ -1095,6 +1185,7 @@ export default function App() {
   };
   const sendCommand = (appendNewline: boolean) => {
     if (connectionRef.current !== "connected") return;
+    if (transcription.isRecording) return;
     if (!activeSessionId) return;
     const data = command;
     if (!data.trim()) return;
@@ -1104,10 +1195,22 @@ export default function App() {
     requestSnapshot(activeSessionId);
   };
   const submitCommand = () => sendCommand(true);
-  const sendRawCommand = () => sendCommand(false);
   const triggerBuild = () => {
     if (connectionRef.current !== "connected") return;
     send({ type: "build_project" });
+  };
+  const requestRunConfigurations = () => {
+    if (connectionRef.current !== "connected") return;
+    send({ type: "list_run_configurations" });
+  };
+  const requestIdeProgress = () => {
+    if (connectionRef.current !== "connected") return;
+    send({ type: "list_ide_progress" });
+  };
+  const runConfiguration = (id: string) => {
+    if (connectionRef.current !== "connected") return;
+    if (!id.trim()) return;
+    send({ type: "run_configuration", id });
   };
 
   const displaySessions = canInteract || showCachedContent ? sessions : [];
@@ -1127,6 +1230,50 @@ export default function App() {
     }
     return "Select a session to view output.";
   })();
+  const visibleProgressTasks = canInteract ? ideProgress : [];
+  const indexingTasks = visibleProgressTasks.filter((task) => task.kind === "indexing");
+  const buildTasks = visibleProgressTasks.filter((task) => task.kind === "build");
+  const buildStatusLabel = buildTasks.length > 0 ? `running (${buildTasks.length})` : buildStatus;
+  const sortedRunConfigurations = useMemo(() => {
+    return [...runConfigurations].sort((a, b) => a.name.localeCompare(b.name));
+  }, [runConfigurations]);
+  const indexingEmptyMessage = canInteract
+    ? "No indexing running."
+    : "Connect to see indexing status.";
+  const buildEmptyMessage = canInteract ? "No builds running." : "Connect to see build status.";
+  const runConfigEmptyMessage = canInteract
+    ? "No run configurations found."
+    : "Connect to load run configurations.";
+
+  const micDisabled = transcription.isRecording
+    ? false
+    : !canInteract || !transcription.canStart;
+  const micIconColor = micDisabled
+    ? THEME.colors.muted
+    : transcription.isRecording
+    ? THEME.colors.danger
+    : THEME.colors.text;
+  const micStatus = (() => {
+    if (!transcription.isSupported) {
+      return "Voice input is only available on device builds.";
+    }
+    if (transcription.permissionState === "denied") {
+      return "Microphone permission denied. Enable it in settings.";
+    }
+    if (transcription.error) {
+      return transcription.error;
+    }
+    if (!transcription.isReady) {
+      return `Loading speech model... ${formatPercent(transcription.downloadProgress)}`;
+    }
+    if (transcription.isRecording) {
+      return "Listening...";
+    }
+    return "";
+  })();
+  const micStatusIsError =
+    Boolean(transcription.error) || transcription.permissionState === "denied";
+  const inputLocked = transcription.isRecording;
 
   useEffect(() => {
     autoScrollEnabledRef.current = true;
@@ -1134,6 +1281,67 @@ export default function App() {
       requestAnimationFrame(() => scrollOutputToEnd(false));
     }
   }, [displayActiveSessionId]);
+
+  const clampFraction = (value?: number | null) => {
+    if (value == null || Number.isNaN(value)) return null;
+    return Math.min(1, Math.max(0, value));
+  };
+
+  const renderProgressTask = (task: IdeProgressTask) => {
+    const fraction = clampFraction(task.fraction);
+    const percent = fraction === null ? null : Math.round(fraction * 100);
+    const accent =
+      task.kind === "indexing" ? THEME.colors.warning : THEME.colors.primary;
+    const width = task.indeterminate ? "35%" : percent !== null ? `${percent}%` : "0%";
+    const subtitleParts = [task.text, task.projectName ? `Project: ${task.projectName}` : null].filter(
+      Boolean,
+    ) as string[];
+    return (
+      <View key={task.id} style={styles.taskRow}>
+        <View style={styles.taskHeaderRow}>
+          <Text style={styles.taskTitle} numberOfLines={1}>
+            {task.title}
+          </Text>
+          <Text style={styles.taskMeta}>
+            {task.indeterminate ? "In progress" : percent !== null ? `${percent}%` : "Queued"}
+          </Text>
+        </View>
+        {subtitleParts.length > 0 ? (
+          <Text style={styles.taskSub} numberOfLines={2}>
+            {subtitleParts.join(" / ")}
+          </Text>
+        ) : null}
+        <View style={styles.progressTrack}>
+          <View style={[styles.progressFill, { width, backgroundColor: accent }]} />
+        </View>
+      </View>
+    );
+  };
+
+  const renderRunConfigRow = (config: RunConfigurationItem) => {
+    const meta = [config.type, config.folder].filter(Boolean).join(" / ");
+    return (
+      <View key={config.id} style={styles.runConfigRow}>
+        <View style={styles.runConfigInfo}>
+          <Text style={styles.runConfigName} numberOfLines={1}>
+            {config.name}
+          </Text>
+          {meta ? (
+            <Text style={styles.runConfigMeta} numberOfLines={1}>
+              {meta}
+            </Text>
+          ) : null}
+        </View>
+        <Pressable
+          style={[styles.runButton, !canInteract && styles.runButtonDisabled]}
+          onPress={() => runConfiguration(config.id)}
+          disabled={!canInteract}
+        >
+          <Text style={styles.runButtonText}>Run</Text>
+        </Pressable>
+      </View>
+    );
+  };
 
   if (!fontsLoaded) {
     return null;
@@ -1405,42 +1613,54 @@ export default function App() {
                     >
                       <Text style={styles.outputText}>{displayOutput || "No output yet."}</Text>
                     </ScrollView>
-                    <View style={styles.commandRow}>
-                      <TextInput
-                        style={[styles.input, styles.commandInput]}
-                        value={command}
-                        onChangeText={setCommand}
-                        autoCapitalize="none"
-                        autoCorrect={false}
-                        blurOnSubmit={false}
-                        returnKeyType="send"
-                        onSubmitEditing={submitCommand}
-                        placeholder="Enter command"
-                        placeholderTextColor="rgba(248, 250, 252, 0.4)"
-                        editable={canInteract}
-                        selectTextOnFocus={canInteract}
-                      />
-                      <Pressable
-                        style={[
-                          styles.micButton,
-                          (!canInteract || !command.trim()) && styles.commandButtonDisabled,
-                        ]}
-                        onPress={sendRawCommand}
-                        disabled={!canInteract || !command.trim()}
-                      >
-                        <Text style={styles.micButtonText}>Type</Text>
-                      </Pressable>
-                      <Pressable
-                        style={[
-                          styles.button,
-                          styles.buttonPrimary,
-                          (!canInteract || !command.trim()) && styles.buttonDisabled,
-                        ]}
-                        onPress={submitCommand}
-                        disabled={!canInteract || !command.trim()}
-                      >
-                        <Text style={styles.buttonText}>Send</Text>
-                      </Pressable>
+                    <View style={styles.commandBlock}>
+                      <View style={styles.commandRow}>
+                        <TextInput
+                          style={[styles.input, styles.commandInput]}
+                          value={command}
+                          onChangeText={setCommand}
+                          autoCapitalize="none"
+                          autoCorrect={false}
+                          blurOnSubmit={false}
+                          returnKeyType="send"
+                          onSubmitEditing={submitCommand}
+                          placeholder="Enter command"
+                          placeholderTextColor="rgba(248, 250, 252, 0.4)"
+                          editable={canInteract && !inputLocked}
+                          selectTextOnFocus={canInteract && !inputLocked}
+                        />
+                        <Pressable
+                          style={[
+                            styles.micButton,
+                            transcription.isRecording && styles.micButtonActive,
+                            micDisabled && styles.commandButtonDisabled,
+                          ]}
+                          onPress={transcription.isRecording ? transcription.stop : transcription.start}
+                          disabled={micDisabled}
+                        >
+                          <View style={styles.micIcon}>
+                            <View style={[styles.micIconHead, { borderColor: micIconColor }]} />
+                            <View style={[styles.micIconStem, { backgroundColor: micIconColor }]} />
+                            <View style={[styles.micIconBase, { backgroundColor: micIconColor }]} />
+                          </View>
+                        </Pressable>
+                        <Pressable
+                          style={[
+                            styles.button,
+                            styles.buttonPrimary,
+                            (!canInteract || !command.trim() || inputLocked) && styles.buttonDisabled,
+                          ]}
+                          onPress={submitCommand}
+                          disabled={!canInteract || !command.trim() || inputLocked}
+                        >
+                          <Text style={styles.buttonText}>Send</Text>
+                        </Pressable>
+                      </View>
+                      {micStatus ? (
+                        <Text style={[styles.muted, micStatusIsError && styles.micStatusError]}>
+                          {micStatus}
+                        </Text>
+                      ) : null}
                     </View>
                     {canInteract ? (
                       <View style={styles.sessionActionRow}>
@@ -1465,21 +1685,74 @@ export default function App() {
               </View>
             ) : null}
 
-            {activeTab === "transcribe" ? (
-              <View style={styles.card}>
-                <Text style={styles.cardTitle}>Transcription</Text>
-                <Text style={styles.muted}>On-device Whisper with live microphone input.</Text>
-                <AudioTranscription />
-              </View>
-            ) : null}
-
             {activeTab === "builds" ? (
               <View style={styles.card}>
-                <Text style={styles.cardTitle}>Builds</Text>
-                <Text style={styles.muted}>Status: {buildStatus}</Text>
-                <Pressable style={[styles.button, styles.buttonPrimary]} onPress={triggerBuild}>
-                  <Text style={styles.buttonText}>Run build</Text>
-                </Pressable>
+                <View style={styles.cardHeaderRow}>
+                  <View style={styles.cardHeaderText}>
+                    <Text style={styles.cardTitle}>Builds</Text>
+                    <Text style={styles.muted}>Status: {buildStatusLabel}</Text>
+                  </View>
+                  <Pressable
+                    style={[styles.button, styles.buttonPrimary, !canInteract && styles.buttonDisabled]}
+                    onPress={triggerBuild}
+                    disabled={!canInteract}
+                  >
+                    <Text style={styles.buttonText}>Run build</Text>
+                  </Pressable>
+                </View>
+                <View style={styles.section}>
+                  <View style={styles.sectionHeader}>
+                    <Text style={styles.sectionTitle}>Indexing</Text>
+                    {indexingTasks.length > 0 ? (
+                      <Text style={styles.sectionMeta}>{indexingTasks.length} running</Text>
+                    ) : null}
+                  </View>
+                  {indexingTasks.length > 0 ? (
+                    indexingTasks.map(renderProgressTask)
+                  ) : (
+                    <Text style={styles.muted}>{indexingEmptyMessage}</Text>
+                  )}
+                </View>
+                <View style={styles.section}>
+                  <View style={styles.sectionHeader}>
+                    <Text style={styles.sectionTitle}>Builds</Text>
+                    {buildTasks.length > 0 ? (
+                      <Text style={styles.sectionMeta}>{buildTasks.length} running</Text>
+                    ) : null}
+                  </View>
+                  {buildTasks.length > 0 ? (
+                    buildTasks.map(renderProgressTask)
+                  ) : (
+                    <Text style={styles.muted}>{buildEmptyMessage}</Text>
+                  )}
+                </View>
+                <View style={styles.section}>
+                  <View style={styles.sectionHeader}>
+                    <Text style={styles.sectionTitle}>Run configurations</Text>
+                    <Pressable
+                      style={styles.sectionAction}
+                      onPress={() => {
+                        requestRunConfigurations();
+                        requestIdeProgress();
+                      }}
+                      disabled={!canInteract}
+                    >
+                      <Text
+                        style={[
+                          styles.sectionActionText,
+                          !canInteract && styles.sectionActionTextDisabled,
+                        ]}
+                      >
+                        Refresh
+                      </Text>
+                    </Pressable>
+                  </View>
+                  {sortedRunConfigurations.length > 0 ? (
+                    sortedRunConfigurations.map(renderRunConfigRow)
+                  ) : (
+                    <Text style={styles.muted}>{runConfigEmptyMessage}</Text>
+                  )}
+                </View>
               </View>
             ) : null}
 
@@ -1517,25 +1790,6 @@ export default function App() {
                   ]}
                 >
                   Terminal
-                </Text>
-              </Pressable>
-              <Pressable
-                style={[styles.bottomTab, activeTab === "transcribe" && styles.bottomTabActive]}
-                onPress={() => setActiveTab("transcribe")}
-              >
-                <View
-                  style={[
-                    styles.bottomTabIndicator,
-                    activeTab === "transcribe" && styles.bottomTabIndicatorActive,
-                  ]}
-                />
-                <Text
-                  style={[
-                    styles.bottomTabText,
-                    activeTab === "transcribe" && styles.bottomTabTextActive,
-                  ]}
-                >
-                  Transcribe
                 </Text>
               </Pressable>
               <Pressable
@@ -1639,6 +1893,132 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: THEME.colors.cardBorder,
     gap: 12,
+  },
+  cardHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  cardHeaderText: {
+    flex: 1,
+    gap: 4,
+  },
+  section: {
+    gap: 10,
+  },
+  sectionHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+  },
+  sectionTitle: {
+    fontFamily: "SpaceGrotesk_700Bold",
+    color: THEME.colors.text,
+    fontSize: 14,
+  },
+  sectionMeta: {
+    fontFamily: "SpaceGrotesk_500Medium",
+    color: THEME.colors.muted,
+    fontSize: 12,
+  },
+  sectionAction: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: THEME.colors.cardBorder,
+  },
+  sectionActionText: {
+    fontFamily: "SpaceGrotesk_700Bold",
+    color: THEME.colors.primary,
+    fontSize: 11,
+  },
+  sectionActionTextDisabled: {
+    color: THEME.colors.muted,
+  },
+  taskRow: {
+    gap: 6,
+    padding: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: THEME.colors.cardBorder,
+    backgroundColor: "rgba(15, 23, 42, 0.55)",
+  },
+  taskHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+  },
+  taskTitle: {
+    flex: 1,
+    fontFamily: "SpaceGrotesk_700Bold",
+    color: THEME.colors.text,
+    fontSize: 13,
+  },
+  taskMeta: {
+    fontFamily: "SpaceGrotesk_500Medium",
+    color: THEME.colors.muted,
+    fontSize: 11,
+  },
+  taskSub: {
+    fontFamily: "SpaceGrotesk_500Medium",
+    color: "rgba(203, 213, 245, 0.75)",
+    fontSize: 11,
+  },
+  progressTrack: {
+    height: 6,
+    borderRadius: 999,
+    backgroundColor: "rgba(248, 250, 252, 0.15)",
+    overflow: "hidden",
+  },
+  progressFill: {
+    height: "100%",
+    borderRadius: 999,
+  },
+  runConfigRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: THEME.colors.cardBorder,
+    backgroundColor: "rgba(15, 23, 42, 0.65)",
+  },
+  runConfigInfo: {
+    flex: 1,
+    gap: 4,
+  },
+  runConfigName: {
+    fontFamily: "SpaceGrotesk_700Bold",
+    color: THEME.colors.text,
+    fontSize: 13,
+  },
+  runConfigMeta: {
+    fontFamily: "SpaceGrotesk_500Medium",
+    color: THEME.colors.muted,
+    fontSize: 11,
+  },
+  runButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: THEME.colors.cardBorder,
+    backgroundColor: "rgba(248, 250, 252, 0.12)",
+  },
+  runButtonDisabled: {
+    opacity: 0.5,
+  },
+  runButtonText: {
+    fontFamily: "SpaceGrotesk_700Bold",
+    color: THEME.colors.text,
+    fontSize: 12,
   },
   modalContainer: {
     flex: 1,
@@ -1917,6 +2297,9 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 18,
   },
+  commandBlock: {
+    gap: 6,
+  },
   commandRow: {
     flexDirection: "row",
     gap: 10,
@@ -1935,13 +2318,36 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  micButtonText: {
-    fontFamily: "SpaceGrotesk_700Bold",
-    color: THEME.colors.text,
-    fontSize: 12,
+  micButtonActive: {
+    borderColor: "rgba(239, 68, 68, 0.7)",
+    backgroundColor: "rgba(239, 68, 68, 0.18)",
+  },
+  micIcon: {
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 2,
+  },
+  micIconHead: {
+    width: 14,
+    height: 18,
+    borderRadius: 7,
+    borderWidth: 2,
+  },
+  micIconStem: {
+    width: 2,
+    height: 6,
+    borderRadius: 1,
+  },
+  micIconBase: {
+    width: 12,
+    height: 2,
+    borderRadius: 1,
   },
   commandButtonDisabled: {
     opacity: 0.5,
+  },
+  micStatusError: {
+    color: THEME.colors.danger,
   },
   sessionActionRow: {
     flexDirection: "row",

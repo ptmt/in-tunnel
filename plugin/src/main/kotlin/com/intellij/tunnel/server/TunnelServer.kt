@@ -2,14 +2,23 @@ package com.intellij.tunnel.server
 
 import com.google.gson.Gson
 import com.google.gson.JsonObject
+import com.intellij.execution.ProgramRunnerUtil
+import com.intellij.execution.RunManager
+import com.intellij.execution.RunnerAndConfigurationSettings
+import com.intellij.execution.executors.DefaultRunExecutor
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
+import com.intellij.openapi.progress.ProgressIndicator
+import com.intellij.openapi.progress.ProgressManagerListener
+import com.intellij.openapi.progress.Task
+import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.project.ProjectManager
 import com.intellij.task.ProjectTaskManager
 import com.intellij.tunnel.auth.TunnelAuthService
 import com.intellij.tunnel.terminal.TerminalSessionManager
 import com.intellij.tunnel.util.NetworkUtils
+import com.intellij.util.messages.MessageBusConnection
 import io.ktor.server.application.Application
 import io.ktor.server.application.call
 import io.ktor.server.application.install
@@ -60,6 +69,14 @@ class TunnelServer {
     private var terminalStreamingJob: Job? = null
     private val terminalStreamLines = 200
     private val terminalStreamIntervalMs = 1000L
+    private val progressTasks = ConcurrentHashMap<String, TrackedTask>()
+    @Volatile
+    private var progressConnection: MessageBusConnection? = null
+    @Volatile
+    private var progressUpdateJob: Job? = null
+    private val progressUpdateIntervalMs = 1000L
+    @Volatile
+    private var lastProgressSnapshot: List<Map<String, Any?>>? = null
 
     val deviceRegistry = DeviceRegistry()
 
@@ -70,6 +87,29 @@ class TunnelServer {
         var deviceName: String,
         var approved: Boolean,
         var approvalRequested: Boolean,
+    )
+
+    private enum class IdeTaskKind {
+        INDEXING,
+        BUILD,
+    }
+
+    private data class TrackedTask(
+        val id: String,
+        val kind: IdeTaskKind,
+        val title: String,
+        val indicator: ProgressIndicator,
+        val projectName: String?,
+        val startedAt: Instant,
+    )
+
+    private data class RunConfigurationEntry(
+        val id: String,
+        val name: String,
+        val type: String,
+        val folder: String?,
+        val temporary: Boolean,
+        val shared: Boolean,
     )
 
     fun start() {
@@ -89,6 +129,7 @@ class TunnelServer {
         }
         engine?.let { port = resolvePort(it) }
         ensureTerminalStreaming()
+        startProgressTracking()
         logger.info("Tunnel server started at ${serverInfo().wsUrl}")
     }
 
@@ -98,6 +139,7 @@ class TunnelServer {
         engine = null
         terminalStreamingJob?.cancel()
         terminalStreamingJob = null
+        stopProgressTracking()
         scope.cancel()
     }
 
@@ -222,6 +264,127 @@ class TunnelServer {
         }
     }
 
+    private fun startProgressTracking() {
+        if (progressConnection != null) return
+        progressConnection = ApplicationManager.getApplication().messageBus.connect()
+        progressConnection?.subscribe(ProgressManagerListener.TOPIC, object : ProgressManagerListener {
+            override fun afterTaskStart(task: Task, indicator: ProgressIndicator) {
+                trackProgressTask(task, indicator)
+            }
+
+            override fun afterTaskFinished(task: Task) {
+                untrackProgressTask(task)
+            }
+        })
+        ensureProgressUpdates()
+    }
+
+    private fun stopProgressTracking() {
+        progressConnection?.disconnect()
+        progressConnection = null
+        progressUpdateJob?.cancel()
+        progressUpdateJob = null
+        progressTasks.clear()
+        lastProgressSnapshot = null
+    }
+
+    private fun ensureProgressUpdates() {
+        val existing = progressUpdateJob
+        if (existing?.isActive == true) return
+        progressUpdateJob = scope.launch {
+            while (true) {
+                try {
+                    pushProgressSnapshot()
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    logger.debug("Progress tracking loop failed", error)
+                }
+                delay(progressUpdateIntervalMs)
+            }
+        }
+    }
+
+    @Synchronized
+    private fun pushProgressSnapshot(force: Boolean = false) {
+        val snapshot = buildProgressSnapshot()
+        if (!force && snapshot == lastProgressSnapshot) return
+        lastProgressSnapshot = snapshot
+        broadcast(mapOf("type" to "ide_progress", "tasks" to snapshot))
+    }
+
+    private fun buildProgressSnapshot(): List<Map<String, Any?>> {
+        if (progressTasks.isEmpty()) return emptyList()
+        val snapshots = mutableListOf<Map<String, Any?>>()
+        progressTasks.forEach { (id, task) ->
+            val indicator = task.indicator
+            if (!indicator.isRunning && !indicator.isIndeterminate) {
+                progressTasks.remove(id)
+                return@forEach
+            }
+            val textParts = listOf(indicator.text, indicator.text2)
+                .mapNotNull { it?.trim()?.takeIf { value -> value.isNotEmpty() } }
+            val detail = textParts.joinToString(" - ").ifBlank { null }
+            val fraction = if (!indicator.isIndeterminate) indicator.fraction else null
+            val safeFraction = fraction?.takeIf { it.isFinite() && it >= 0.0 }
+            snapshots.add(
+                mapOf(
+                    "id" to id,
+                    "kind" to task.kind.name.lowercase(),
+                    "title" to task.title,
+                    "text" to detail,
+                    "fraction" to safeFraction,
+                    "indeterminate" to indicator.isIndeterminate,
+                    "projectName" to task.projectName,
+                    "startedAt" to task.startedAt.toString(),
+                )
+            )
+        }
+        return snapshots.sortedBy { it["startedAt"] as String }
+    }
+
+    private fun sendProgressSnapshot(session: DefaultWebSocketSession, connectionId: String) {
+        val snapshot = buildProgressSnapshot()
+        lastProgressSnapshot = snapshot
+        sendJson(session, mapOf("type" to "ide_progress", "tasks" to snapshot), connectionId)
+    }
+
+    private fun trackProgressTask(task: Task, indicator: ProgressIndicator) {
+        val kind = classifyTask(task, indicator) ?: return
+        val id = taskId(task)
+        val title = task.title.takeIf { it.isNotBlank() }
+            ?: indicator.text?.takeIf { it.isNotBlank() }
+            ?: kind.name.lowercase().replaceFirstChar { it.uppercase() }
+        val projectName = task.project?.name?.takeIf { it.isNotBlank() }
+        progressTasks[id] = TrackedTask(id, kind, title, indicator, projectName, Instant.now())
+        pushProgressSnapshot(force = true)
+    }
+
+    private fun untrackProgressTask(task: Task) {
+        val id = taskId(task)
+        if (progressTasks.remove(id) != null) {
+            pushProgressSnapshot(force = true)
+        }
+    }
+
+    private fun classifyTask(task: Task, indicator: ProgressIndicator): IdeTaskKind? {
+        val combined = sequenceOf(task.title, indicator.text, indicator.text2)
+            .filterNotNull()
+            .joinToString(" ")
+            .lowercase()
+        if (combined.contains("index") || combined.contains("scann")) {
+            return IdeTaskKind.INDEXING
+        }
+        if (combined.contains("build") || combined.contains("compile") || combined.contains("make") || combined.contains("assemble")) {
+            return IdeTaskKind.BUILD
+        }
+        return null
+    }
+
+    private fun taskId(task: Task): String {
+        val rawId = task.id?.toString()?.trim().orEmpty()
+        return if (rawId.isNotEmpty()) rawId else "task-${System.identityHashCode(task)}"
+    }
+
     private fun handleMessage(text: String, connectionId: String, session: DefaultWebSocketSession) {
         val payload = runCatching { gson.fromJson(text, JsonObject::class.java) }.getOrNull()
             ?: run {
@@ -336,6 +499,32 @@ class TunnelServer {
                 "build_project" -> {
                     if (!ensureApproved(connectionId, session, context)) return
                     triggerBuild()
+                }
+                "list_ide_progress" -> {
+                    if (!ensureApproved(connectionId, session, context)) return
+                    sendProgressSnapshot(session, connectionId)
+                }
+                "list_run_configurations" -> {
+                    if (!ensureApproved(connectionId, session, context)) return
+                    sendRunConfigurations(session, connectionId)
+                }
+                "run_configuration" -> {
+                    if (!ensureApproved(connectionId, session, context)) return
+                    val id = payload.get("id")?.asString?.trim().orEmpty()
+                    if (id.isEmpty()) {
+                        sendJson(
+                            session,
+                            mapOf(
+                                "type" to "run_configuration_status",
+                                "status" to "failed",
+                                "id" to "",
+                                "message" to "Missing id.",
+                            ),
+                            connectionId,
+                        )
+                        return
+                    }
+                    runConfigurationById(id, session, connectionId)
                 }
                 else -> {
                     sendJson(session, mapOf("type" to "error", "message" to "Unknown message type: $type"), connectionId)
@@ -541,6 +730,111 @@ class TunnelServer {
             mapOf("type" to "approval_granted", "deviceId" to context.deviceId),
             connectionId,
         )
+        sendRunConfigurations(session, connectionId)
+        sendProgressSnapshot(session, connectionId)
+    }
+
+    private fun runConfigurationId(settings: RunnerAndConfigurationSettings): String {
+        val uniqueId = settings.uniqueID.trim()
+        return if (uniqueId.isNotEmpty()) uniqueId else "${settings.type.id}:${settings.name}"
+    }
+
+    private fun sendRunConfigurations(session: DefaultWebSocketSession, connectionId: String) {
+        val project = ProjectManager.getInstance().openProjects.firstOrNull()
+        if (project == null) {
+            sendJson(session, mapOf("type" to "run_configurations", "items" to emptyList<Any>()), connectionId)
+            return
+        }
+        val entries = collectRunConfigurations(project)
+        sendJson(session, mapOf("type" to "run_configurations", "items" to entries), connectionId)
+    }
+
+    private fun collectRunConfigurations(project: Project): List<RunConfigurationEntry> {
+        return ApplicationManager.getApplication().runReadAction<List<RunConfigurationEntry>> {
+            val runManager = RunManager.getInstance(project)
+            runManager.allSettings
+                .asSequence()
+                .filter { !it.isTemplate }
+                .sortedBy { it.name.lowercase() }
+                .map { settings ->
+                    val id = runConfigurationId(settings)
+                    RunConfigurationEntry(
+                        id = id,
+                        name = settings.name,
+                        type = settings.type.displayName,
+                        folder = settings.folderName?.takeIf { it.isNotBlank() },
+                        temporary = settings.isTemporary,
+                        shared = settings.isShared,
+                    )
+                }
+                .toList()
+        }
+    }
+
+    private fun runConfigurationById(
+        id: String,
+        session: DefaultWebSocketSession,
+        connectionId: String,
+    ) {
+        val project = ProjectManager.getInstance().openProjects.firstOrNull()
+        if (project == null) {
+            sendJson(
+                session,
+                mapOf(
+                    "type" to "run_configuration_status",
+                    "status" to "failed",
+                    "id" to id,
+                    "message" to "No open project",
+                ),
+                connectionId,
+            )
+            return
+        }
+        val settings = ApplicationManager.getApplication().runReadAction {
+            RunManager.getInstance(project).allSettings.firstOrNull { runConfigurationId(it) == id }
+        }
+        if (settings == null) {
+            sendJson(
+                session,
+                mapOf(
+                    "type" to "run_configuration_status",
+                    "status" to "failed",
+                    "id" to id,
+                    "message" to "Run configuration not found",
+                ),
+                connectionId,
+            )
+            return
+        }
+        val executor = DefaultRunExecutor.getRunExecutorInstance()
+        ApplicationManager.getApplication().invokeLater {
+            try {
+                settings.checkSettings(executor)
+                ProgramRunnerUtil.executeConfiguration(project, settings, executor)
+                sendJson(
+                    session,
+                    mapOf(
+                        "type" to "run_configuration_status",
+                        "status" to "started",
+                        "id" to id,
+                        "name" to settings.name,
+                    ),
+                    connectionId,
+                )
+            } catch (error: Exception) {
+                sendJson(
+                    session,
+                    mapOf(
+                        "type" to "run_configuration_status",
+                        "status" to "failed",
+                        "id" to id,
+                        "name" to settings.name,
+                        "message" to (error.message ?: "Failed to run configuration"),
+                    ),
+                    connectionId,
+                )
+            }
+        }
     }
 
     private fun triggerBuild() {

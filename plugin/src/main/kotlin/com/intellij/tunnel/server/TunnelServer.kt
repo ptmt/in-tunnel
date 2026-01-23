@@ -18,6 +18,7 @@ import com.intellij.task.ProjectTaskManager
 import com.intellij.tunnel.auth.TunnelAuthService
 import com.intellij.tunnel.terminal.TerminalSessionManager
 import com.intellij.tunnel.util.NetworkUtils
+import com.intellij.openapi.util.Computable
 import com.intellij.util.messages.MessageBusConnection
 import io.ktor.server.application.Application
 import io.ktor.server.application.call
@@ -790,9 +791,11 @@ class TunnelServer {
             )
             return
         }
-        val settings = ApplicationManager.getApplication().runReadAction {
-            RunManager.getInstance(project).allSettings.firstOrNull { runConfigurationId(it) == id }
-        }
+        val settings = ApplicationManager.getApplication().runReadAction(
+            Computable<RunnerAndConfigurationSettings?> {
+                RunManager.getInstance(project).allSettings.firstOrNull { runConfigurationId(it) == id }
+            }
+        )
         if (settings == null) {
             sendJson(
                 session,

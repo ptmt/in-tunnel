@@ -1,5 +1,5 @@
 plugins {
-    kotlin("jvm") version "1.9.24"
+    kotlin("jvm") version "2.3.0"
     id("org.jetbrains.intellij.platform") version "2.10.5"
 }
 
@@ -21,7 +21,7 @@ configurations.configureEach {
 
 dependencies {
     intellijPlatform {
-        create("IC", "2024.2")
+        create("IU", "261.18908")
         bundledPlugin("org.jetbrains.plugins.terminal")
         bundledPlugin("com.jetbrains.sh")
         testFramework(org.jetbrains.intellij.platform.gradle.TestFrameworkType.Platform)
@@ -41,8 +41,8 @@ dependencies {
 intellijPlatform {
     pluginConfiguration {
         ideaVersion {
-            sinceBuild = "242"
-            untilBuild = "242.*"
+            sinceBuild = "261.18908"
+            untilBuild = "261.*"
         }
     }
 }

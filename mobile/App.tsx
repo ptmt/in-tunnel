@@ -1058,7 +1058,7 @@ export default function App() {
         } else if (message.type === "run_configurations") {
           setRunConfigurations(message.items ?? []);
         } else if (message.type === "run_configuration_status") {
-          const label = message.name ?? message.id || "Unknown configuration";
+          const label = (message.name ?? message.id) || "Unknown configuration";
           if (message.status === "started") {
             pushLog(`Run started: ${label}`);
           } else {

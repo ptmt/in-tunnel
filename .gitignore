@@ -9,6 +9,7 @@
 **/build/
 **/out/
 .intellijPlatform/
+plugin/.kotlin/errors/
 
 # Expo / React Native
 /node_modules/

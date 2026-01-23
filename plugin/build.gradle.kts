@@ -13,7 +13,7 @@ repositories {
     }
 }
 
-configurations.configureEach {
+configurations.matching { it.name.endsWith("RuntimeClasspath") }.configureEach {
     exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-core")
     exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-core-jvm")
     exclude(group = "org.jetbrains.kotlinx", module = "kotlinx-coroutines-jdk8")
@@ -21,7 +21,7 @@ configurations.configureEach {
 
 dependencies {
     intellijPlatform {
-        create("IU", "261.18908")
+        create("IU", "261.17801.55")
         bundledPlugin("org.jetbrains.plugins.terminal")
         bundledPlugin("com.jetbrains.sh")
         testFramework(org.jetbrains.intellij.platform.gradle.TestFrameworkType.Platform)
@@ -41,7 +41,7 @@ dependencies {
 intellijPlatform {
     pluginConfiguration {
         ideaVersion {
-            sinceBuild = "261.18908"
+            sinceBuild = "261.17801.55"
             untilBuild = "261.*"
         }
     }

@@ -2,23 +2,40 @@ package com.intellij.tunnel.server
 
 import com.google.gson.Gson
 import com.google.gson.JsonObject
+import com.intellij.build.BuildProgressListener
+import com.intellij.build.BuildViewManager
+import com.intellij.build.events.BuildEvent
+import com.intellij.build.events.FinishBuildEvent
+import com.intellij.build.events.MessageEvent
+import com.intellij.build.events.OutputBuildEvent
+import com.intellij.build.events.StartBuildEvent
+import com.intellij.execution.ExecutionListener
+import com.intellij.execution.ExecutionManager
 import com.intellij.execution.ProgramRunnerUtil
 import com.intellij.execution.RunManager
 import com.intellij.execution.RunnerAndConfigurationSettings
 import com.intellij.execution.executors.DefaultRunExecutor
+import com.intellij.execution.process.ProcessEvent
+import com.intellij.execution.process.ProcessHandler
+import com.intellij.execution.process.ProcessListener
+import com.intellij.execution.process.ProcessOutputType
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManagerListener
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.project.ProjectManager
+import com.intellij.openapi.project.ProjectManagerListener
+import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.util.Computable
+import com.intellij.openapi.util.Disposer
 import com.intellij.task.ProjectTaskManager
 import com.intellij.tunnel.auth.TunnelAuthService
 import com.intellij.tunnel.terminal.TerminalSessionManager
 import com.intellij.tunnel.util.NetworkUtils
-import com.intellij.openapi.util.Computable
 import com.intellij.util.messages.MessageBusConnection
 import io.ktor.server.application.Application
 import io.ktor.server.application.call
@@ -78,6 +95,14 @@ class TunnelServer {
     private val progressUpdateIntervalMs = 1000L
     @Volatile
     private var lastProgressSnapshot: List<Map<String, Any?>>? = null
+    private val runOutputContexts = ConcurrentHashMap<ProcessHandler, RunOutputContext>()
+    private val runOutputListeners = ConcurrentHashMap<ProcessHandler, ProcessListener>()
+    @Volatile
+    private var executionConnection: MessageBusConnection? = null
+    private val buildLogDisposables = ConcurrentHashMap<Project, Disposable>()
+    private val buildLogContexts = ConcurrentHashMap<Project, ConcurrentHashMap<Any, BuildLogContext>>()
+    @Volatile
+    private var buildLogConnection: MessageBusConnection? = null
 
     val deviceRegistry = DeviceRegistry()
 
@@ -90,18 +115,31 @@ class TunnelServer {
         var approvalRequested: Boolean,
     )
 
-    private enum class IdeTaskKind {
-        INDEXING,
-        BUILD,
+    private enum class IdeTaskKind(val defaultTitle: String) {
+        INDEXING("Indexing"),
+        BUILD("Build"),
+        SYNC("Sync"),
     }
 
     private data class TrackedTask(
         val id: String,
-        val kind: IdeTaskKind,
-        val title: String,
+        val task: Task,
         val indicator: ProgressIndicator,
         val projectName: String?,
         val startedAt: Instant,
+    )
+
+    private data class RunOutputContext(
+        val runId: String,
+        val name: String,
+        val configId: String?,
+        val executorId: String,
+        val projectName: String?,
+    )
+
+    private data class BuildLogContext(
+        val title: String,
+        val projectName: String,
     )
 
     private data class RunConfigurationEntry(
@@ -131,6 +169,8 @@ class TunnelServer {
         engine?.let { port = resolvePort(it) }
         ensureTerminalStreaming()
         startProgressTracking()
+        startExecutionTracking()
+        startBuildLogTracking()
         logger.info("Tunnel server started at ${serverInfo().wsUrl}")
     }
 
@@ -141,6 +181,8 @@ class TunnelServer {
         terminalStreamingJob?.cancel()
         terminalStreamingJob = null
         stopProgressTracking()
+        stopExecutionTracking()
+        stopBuildLogTracking()
         scope.cancel()
     }
 
@@ -289,6 +331,186 @@ class TunnelServer {
         lastProgressSnapshot = null
     }
 
+    private fun startExecutionTracking() {
+        if (executionConnection != null) return
+        executionConnection = ApplicationManager.getApplication().messageBus.connect()
+        executionConnection?.subscribe(ExecutionManager.EXECUTION_TOPIC, object : ExecutionListener {
+            override fun processStarted(
+                executorId: String,
+                env: com.intellij.execution.runners.ExecutionEnvironment,
+                handler: ProcessHandler,
+            ) {
+                attachRunOutputListener(executorId, env, handler)
+            }
+
+            override fun processTerminated(
+                executorId: String,
+                env: com.intellij.execution.runners.ExecutionEnvironment,
+                handler: ProcessHandler,
+                exitCode: Int,
+            ) {
+                detachRunOutputListener(handler)
+            }
+        })
+    }
+
+    private fun stopExecutionTracking() {
+        executionConnection?.disconnect()
+        executionConnection = null
+        runOutputListeners.forEach { (handler, listener) ->
+            runCatching { handler.removeProcessListener(listener) }
+        }
+        runOutputListeners.clear()
+        runOutputContexts.clear()
+    }
+
+    private fun startBuildLogTracking() {
+        if (buildLogConnection != null) return
+        ProjectManager.getInstance().openProjects.forEach { attachBuildLogger(it) }
+        buildLogConnection = ApplicationManager.getApplication().messageBus.connect()
+        buildLogConnection?.subscribe(ProjectManager.TOPIC, object : ProjectManagerListener {
+            @Suppress("OVERRIDE_DEPRECATION")
+            override fun projectOpened(project: Project) {
+                attachBuildLogger(project)
+            }
+
+            @Suppress("OVERRIDE_DEPRECATION")
+            override fun projectClosed(project: Project) {
+                detachBuildLogger(project)
+            }
+        })
+    }
+
+    private fun stopBuildLogTracking() {
+        buildLogConnection?.disconnect()
+        buildLogConnection = null
+        buildLogDisposables.values.forEach { Disposer.dispose(it) }
+        buildLogDisposables.clear()
+        buildLogContexts.clear()
+    }
+
+    private fun attachRunOutputListener(
+        executorId: String,
+        env: com.intellij.execution.runners.ExecutionEnvironment,
+        handler: ProcessHandler,
+    ) {
+        if (runOutputContexts.containsKey(handler)) return
+        val settings = env.runnerAndConfigurationSettings
+        val runId = env.executionId.takeIf { it != 0L }?.toString()
+            ?: "run-${System.identityHashCode(handler)}"
+        val name = settings?.name?.takeIf { it.isNotBlank() }
+            ?: env.runProfile.name.takeIf { it.isNotBlank() }
+            ?: "Run"
+        val configId = settings?.let { runConfigurationId(it) }
+        val context = RunOutputContext(
+            runId = runId,
+            name = name,
+            configId = configId,
+            executorId = executorId,
+            projectName = env.project.name.takeIf { it.isNotBlank() },
+        )
+        runOutputContexts[handler] = context
+        val listener = object : ProcessListener {
+            override fun onTextAvailable(event: ProcessEvent, outputType: com.intellij.openapi.util.Key<*>) {
+                val text = event.text
+                if (text.isBlank()) return
+                val stream = when (outputType) {
+                    ProcessOutputType.STDOUT -> "stdout"
+                    ProcessOutputType.STDERR -> "stderr"
+                    ProcessOutputType.SYSTEM -> "system"
+                    else -> "system"
+                }
+                broadcastRunOutput(context, text, stream)
+            }
+
+            override fun processTerminated(event: ProcessEvent) {
+                detachRunOutputListener(handler)
+            }
+        }
+        runOutputListeners[handler] = listener
+        handler.addProcessListener(listener)
+    }
+
+    private fun detachRunOutputListener(handler: ProcessHandler) {
+        val listener = runOutputListeners.remove(handler) ?: return
+        runOutputContexts.remove(handler)
+        runCatching { handler.removeProcessListener(listener) }
+    }
+
+    private fun attachBuildLogger(project: Project) {
+        if (project.isDisposed) return
+        if (buildLogDisposables.containsKey(project)) return
+        val disposable = Disposer.newDisposable("TunnelBuildLogTracker:${project.name}")
+        buildLogDisposables[project] = disposable
+        val contextMap = ConcurrentHashMap<Any, BuildLogContext>()
+        buildLogContexts[project] = contextMap
+        val manager = project.service<BuildViewManager>()
+        manager.addListener(object : BuildProgressListener {
+            override fun onEvent(buildId: Any, event: BuildEvent) {
+                when (event) {
+                    is StartBuildEvent -> {
+                        val title = event.buildDescriptor.title.takeIf { it.isNotBlank() } ?: "Build"
+                        contextMap[buildId] = BuildLogContext(title, project.name)
+                    }
+                    is FinishBuildEvent -> {
+                        contextMap.remove(buildId)
+                    }
+                }
+                val context = contextMap[buildId] ?: BuildLogContext("Build", project.name)
+                when (event) {
+                    is OutputBuildEvent -> {
+                        val text = event.message
+                        if (text.isBlank()) return
+                        val level = when (event.outputType) {
+                            ProcessOutputType.STDERR -> "stderr"
+                            ProcessOutputType.SYSTEM -> "system"
+                            else -> "stdout"
+                        }
+                        broadcastBuildOutput(buildId, context, text, level)
+                    }
+                    is MessageEvent -> {
+                        val text = event.message
+                        if (text.isBlank()) return
+                        val level = event.kind.name.lowercase()
+                        broadcastBuildOutput(buildId, context, text, level)
+                    }
+                }
+            }
+        }, disposable)
+    }
+
+    private fun detachBuildLogger(project: Project) {
+        val disposable = buildLogDisposables.remove(project) ?: return
+        Disposer.dispose(disposable)
+        buildLogContexts.remove(project)
+    }
+
+    private fun broadcastRunOutput(context: RunOutputContext, text: String, stream: String) {
+        val payload = mutableMapOf<String, Any>(
+            "type" to "run_output",
+            "runId" to context.runId,
+            "name" to context.name,
+            "text" to text,
+            "stream" to stream,
+            "executorId" to context.executorId,
+        )
+        context.configId?.let { payload["configId"] = it }
+        context.projectName?.let { payload["projectName"] = it }
+        broadcast(payload)
+    }
+
+    private fun broadcastBuildOutput(buildId: Any, context: BuildLogContext, text: String, level: String) {
+        val payload = mutableMapOf<String, Any>(
+            "type" to "build_output",
+            "buildId" to buildId.toString(),
+            "title" to context.title,
+            "text" to text,
+            "level" to level,
+            "projectName" to context.projectName,
+        )
+        broadcast(payload)
+    }
+
     private fun ensureProgressUpdates() {
         val existing = progressUpdateJob
         if (existing?.isActive == true) return
@@ -322,16 +544,19 @@ class TunnelServer {
                 progressTasks.remove(id)
                 return@forEach
             }
+            val kind = classifyTask(task.task, indicator) ?: return@forEach
+            val title = resolveTaskTitle(task.task, indicator, kind)
             val textParts = listOf(indicator.text, indicator.text2)
                 .mapNotNull { it?.trim()?.takeIf { value -> value.isNotEmpty() } }
+                .filterNot { it.equals(title, ignoreCase = true) }
             val detail = textParts.joinToString(" - ").ifBlank { null }
             val fraction = if (!indicator.isIndeterminate) indicator.fraction else null
             val safeFraction = fraction?.takeIf { it.isFinite() && it >= 0.0 }
             snapshots.add(
                 mapOf(
                     "id" to id,
-                    "kind" to task.kind.name.lowercase(),
-                    "title" to task.title,
+                    "kind" to kind.name.lowercase(),
+                    "title" to title,
                     "text" to detail,
                     "fraction" to safeFraction,
                     "indeterminate" to indicator.isIndeterminate,
@@ -350,13 +575,9 @@ class TunnelServer {
     }
 
     private fun trackProgressTask(task: Task, indicator: ProgressIndicator) {
-        val kind = classifyTask(task, indicator) ?: return
         val id = taskId(task)
-        val title = task.title.takeIf { it.isNotBlank() }
-            ?: indicator.text?.takeIf { it.isNotBlank() }
-            ?: kind.name.lowercase().replaceFirstChar { it.uppercase() }
         val projectName = task.project?.name?.takeIf { it.isNotBlank() }
-        progressTasks[id] = TrackedTask(id, kind, title, indicator, projectName, Instant.now())
+        progressTasks[id] = TrackedTask(id, task, indicator, projectName, Instant.now())
         pushProgressSnapshot(force = true)
     }
 
@@ -369,16 +590,41 @@ class TunnelServer {
 
     private fun classifyTask(task: Task, indicator: ProgressIndicator): IdeTaskKind? {
         val combined = sequenceOf(task.title, indicator.text, indicator.text2)
-            .filterNotNull()
+            .mapNotNull { it?.trim()?.takeIf { value -> value.isNotEmpty() } }
             .joinToString(" ")
             .lowercase()
+        if (combined.isBlank()) return null
         if (combined.contains("index") || combined.contains("scann")) {
             return IdeTaskKind.INDEXING
         }
-        if (combined.contains("build") || combined.contains("compile") || combined.contains("make") || combined.contains("assemble")) {
+        val buildHints = listOf("build", "compile", "make", "assemble", "rebuild", "javac", "kotlinc", "compiler")
+        val syncHints = listOf(
+            "import",
+            "sync",
+            "refresh",
+            "reload",
+            "resolve",
+            "dependency",
+            "gradle",
+            "maven",
+            "external system",
+        )
+        val hasBuildHint = buildHints.any { combined.contains(it) }
+        val hasSyncHint = syncHints.any { combined.contains(it) }
+        if (hasBuildHint) {
             return IdeTaskKind.BUILD
         }
+        if (hasSyncHint) {
+            return IdeTaskKind.SYNC
+        }
         return null
+    }
+
+    private fun resolveTaskTitle(task: Task, indicator: ProgressIndicator, kind: IdeTaskKind): String {
+        return sequenceOf(task.title, indicator.text, indicator.text2)
+            .mapNotNull { it?.trim()?.takeIf { value -> value.isNotEmpty() } }
+            .firstOrNull()
+            ?: kind.defaultTitle
     }
 
     private fun taskId(task: Task): String {
@@ -850,7 +1096,25 @@ class TunnelServer {
         broadcast(mapOf("type" to "build_status", "status" to "started"))
         val taskManager = ProjectTaskManager.getInstance(project)
         taskManager.buildAllModules()
-            .onSuccess { broadcast(mapOf("type" to "build_status", "status" to "finished")) }
+            .onSuccess { result ->
+                if (result == null) {
+                    broadcast(mapOf("type" to "build_status", "status" to "finished"))
+                    return@onSuccess
+                }
+                val (status, message) = when {
+                    result.isAborted -> "failed" to "Build aborted"
+                    result.hasErrors() -> "failed" to "Build finished with errors"
+                    else -> "finished" to null
+                }
+                val payload = mutableMapOf<String, Any>(
+                    "type" to "build_status",
+                    "status" to status,
+                )
+                if (message != null) {
+                    payload["message"] = message
+                }
+                broadcast(payload)
+            }
             .onError { error ->
                 broadcast(
                     mapOf(

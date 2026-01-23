@@ -42,7 +42,7 @@ type RunConfigurationItem = {
 
 type IdeProgressTask = {
   id: string;
-  kind: "indexing" | "build";
+  kind: "indexing" | "build" | "sync";
   title: string;
   text?: string | null;
   fraction?: number | null;
@@ -73,13 +73,32 @@ type ServerMessage =
   | { type: "terminal_error"; message: string }
   | { type: "ide_progress"; tasks: IdeProgressTask[] }
   | { type: "build_status"; status: string; message?: string }
+  | {
+      type: "build_output";
+      buildId: string;
+      title?: string | null;
+      text: string;
+      level?: string | null;
+      projectName?: string | null;
+    }
   | { type: "run_configurations"; items: RunConfigurationItem[] }
   | { type: "run_configuration_status"; status: string; id: string; name?: string; message?: string }
+  | {
+      type: "run_output";
+      runId: string;
+      name?: string | null;
+      text: string;
+      stream?: string | null;
+      projectName?: string | null;
+      configId?: string | null;
+      executorId?: string | null;
+    }
   | { type: "error"; message?: string; code?: string };
 
 const initialServerUrl = "ws://localhost:8765/ws";
 const SESSION_POLL_MS = 6000;
 const HISTORY_LIMIT = 6;
+const LOG_LIMIT = 200;
 const STORAGE_KEYS = {
   serverUrl: "tunnel_server_url",
   pairingToken: "tunnel_pairing_token",
@@ -207,7 +226,33 @@ export default function App() {
   }, [transcription.isRecording, transcriptionText]);
 
   const pushLog = (entry: string) => {
-    setLogs((prev) => [entry, ...prev].slice(0, 40));
+    setLogs((prev) => [entry, ...prev].slice(0, LOG_LIMIT));
+  };
+
+  const appendOutputLines = (
+    source: "Build" | "Run",
+    title: string | null | undefined,
+    text: string,
+    level: string | null | undefined,
+    projectName: string | null | undefined,
+  ) => {
+    const normalized = text.replace(/\r\n/g, "\n");
+    const lines = normalized
+      .split("\n")
+      .map((line) => line.replace(/\s+$/, ""))
+      .filter((line) => line.length > 0);
+    if (lines.length === 0) return;
+    const labelParts = [source, title?.trim()].filter(Boolean) as string[];
+    let label = labelParts.join(" ");
+    if (projectName?.trim()) {
+      label = `${label} (${projectName.trim()})`;
+    }
+    const tag = level && level !== "stdout" ? ` [${level}]` : "";
+    const entries = lines.map((line) => `${label}${tag}: ${line}`);
+    setLogs((prev) => {
+      const additions = [...entries].reverse();
+      return [...additions, ...prev].slice(0, LOG_LIMIT);
+    });
   };
 
   const describePayloadType = (payload: Record<string, unknown>) => {
@@ -221,6 +266,9 @@ export default function App() {
   };
 
   const logInbound = (message: ServerMessage) => {
+    if (message.type === "build_output" || message.type === "run_output") {
+      return;
+    }
     if (message.type === "hello_ack") {
       pushLog(`ws <= hello_ack (${message.deviceId.slice(0, 6)})`);
       return;
@@ -1055,6 +1103,14 @@ export default function App() {
           if (message.message) {
             pushLog(`Build: ${message.message}`);
           }
+        } else if (message.type === "build_output") {
+          appendOutputLines(
+            "Build",
+            message.title,
+            message.text,
+            message.level,
+            message.projectName,
+          );
         } else if (message.type === "run_configurations") {
           setRunConfigurations(message.items ?? []);
         } else if (message.type === "run_configuration_status") {
@@ -1064,6 +1120,14 @@ export default function App() {
           } else {
             pushLog(`Run ${message.status}: ${label}${message.message ? ` (${message.message})` : ""}`);
           }
+        } else if (message.type === "run_output") {
+          appendOutputLines(
+            "Run",
+            message.name,
+            message.text,
+            message.stream,
+            message.projectName,
+          );
         } else if (message.type === "terminal_error") {
           pushLog(`Terminal: ${message.message}`);
         } else if (message.type === "error") {
@@ -1232,14 +1296,21 @@ export default function App() {
   })();
   const visibleProgressTasks = canInteract ? ideProgress : [];
   const indexingTasks = visibleProgressTasks.filter((task) => task.kind === "indexing");
+  const syncTasks = visibleProgressTasks.filter((task) => task.kind === "sync");
   const buildTasks = visibleProgressTasks.filter((task) => task.kind === "build");
-  const buildStatusLabel = buildTasks.length > 0 ? `running (${buildTasks.length})` : buildStatus;
+  const buildStatusCount = buildTasks.length + syncTasks.length;
+  const buildStatusLabel = buildStatusCount > 0 ? `running (${buildStatusCount})` : buildStatus;
+  const hasBuildBadge = buildStatus === "started" || buildStatusCount > 0;
+  const buildBadgeText = buildStatusCount > 9 ? "9+" : String(buildStatusCount);
   const sortedRunConfigurations = useMemo(() => {
     return [...runConfigurations].sort((a, b) => a.name.localeCompare(b.name));
   }, [runConfigurations]);
   const indexingEmptyMessage = canInteract
     ? "No indexing running."
     : "Connect to see indexing status.";
+  const syncEmptyMessage = canInteract
+    ? "No project sync running."
+    : "Connect to see sync status.";
   const buildEmptyMessage = canInteract ? "No builds running." : "Connect to see build status.";
   const runConfigEmptyMessage = canInteract
     ? "No run configurations found."
@@ -1291,7 +1362,11 @@ export default function App() {
     const fraction = clampFraction(task.fraction);
     const percent = fraction === null ? null : Math.round(fraction * 100);
     const accent =
-      task.kind === "indexing" ? THEME.colors.warning : THEME.colors.primary;
+      task.kind === "indexing"
+        ? THEME.colors.warning
+        : task.kind === "sync"
+        ? THEME.colors.success
+        : THEME.colors.primary;
     const width = task.indeterminate ? "35%" : percent !== null ? `${percent}%` : "0%";
     const subtitleParts = [task.text, task.projectName ? `Project: ${task.projectName}` : null].filter(
       Boolean,
@@ -1715,6 +1790,19 @@ export default function App() {
                 </View>
                 <View style={styles.section}>
                   <View style={styles.sectionHeader}>
+                    <Text style={styles.sectionTitle}>Project sync</Text>
+                    {syncTasks.length > 0 ? (
+                      <Text style={styles.sectionMeta}>{syncTasks.length} running</Text>
+                    ) : null}
+                  </View>
+                  {syncTasks.length > 0 ? (
+                    syncTasks.map(renderProgressTask)
+                  ) : (
+                    <Text style={styles.muted}>{syncEmptyMessage}</Text>
+                  )}
+                </View>
+                <View style={styles.section}>
+                  <View style={styles.sectionHeader}>
                     <Text style={styles.sectionTitle}>Builds</Text>
                     {buildTasks.length > 0 ? (
                       <Text style={styles.sectionMeta}>{buildTasks.length} running</Text>
@@ -1802,14 +1890,25 @@ export default function App() {
                     activeTab === "builds" && styles.bottomTabIndicatorActive,
                   ]}
                 />
-                <Text
-                  style={[
-                    styles.bottomTabText,
-                    activeTab === "builds" && styles.bottomTabTextActive,
-                  ]}
-                >
-                  Builds
-                </Text>
+                <View style={styles.bottomTabLabelRow}>
+                  <Text
+                    style={[
+                      styles.bottomTabText,
+                      activeTab === "builds" && styles.bottomTabTextActive,
+                    ]}
+                  >
+                    Builds
+                  </Text>
+                  {hasBuildBadge ? (
+                    buildStatusCount > 0 ? (
+                      <View style={styles.bottomTabBadge}>
+                        <Text style={styles.bottomTabBadgeText}>{buildBadgeText}</Text>
+                      </View>
+                    ) : (
+                      <View style={styles.bottomTabBadgeDot} />
+                    )
+                  ) : null}
+                </View>
               </Pressable>
               <Pressable
                 style={[styles.bottomTab, activeTab === "activity" && styles.bottomTabActive]}
@@ -2388,6 +2487,31 @@ const styles = StyleSheet.create({
     fontFamily: "SpaceGrotesk_700Bold",
     color: THEME.colors.muted,
     fontSize: 12,
+  },
+  bottomTabLabelRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  bottomTabBadge: {
+    minWidth: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: THEME.colors.warning,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 4,
+  },
+  bottomTabBadgeText: {
+    fontFamily: "SpaceGrotesk_700Bold",
+    fontSize: 10,
+    color: THEME.colors.backgroundBottom,
+  },
+  bottomTabBadgeDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: THEME.colors.warning,
   },
   bottomTabTextActive: {
     color: THEME.colors.text,

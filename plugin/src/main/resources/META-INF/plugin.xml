@@ -17,7 +17,6 @@
             displayName="Tunnel"
             instance="com.intellij.tunnel.settings.TunnelSettingsConfigurable" />
         <applicationService serviceImplementation="com.intellij.tunnel.server.TunnelServerService" />
-        <applicationService serviceImplementation="com.intellij.tunnel.settings.TunnelTerminalSettingsService" />
         <postStartupActivity implementation="com.intellij.tunnel.startup.TunnelStartupActivity" />
     </extensions>
 </idea-plugin>

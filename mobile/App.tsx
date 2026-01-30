@@ -53,6 +53,29 @@ type RunConfigurationItem = {
   shared?: boolean;
 };
 
+type VcsCommand = "commit" | "pull" | "rebase_main" | "push";
+type VcsStatus = "queued" | "started" | "success" | "failed" | "conflicts";
+
+type VcsStatusMessage = {
+  type: "vcs_status";
+  id: string;
+  command: VcsCommand;
+  status: VcsStatus;
+  message?: string;
+  roots?: string[];
+  conflicts?: string[];
+  durationMs?: number;
+};
+
+type VcsOutputMessage = {
+  type: "vcs_output";
+  id: string;
+  command: VcsCommand;
+  text: string;
+  stream?: string | null;
+  root?: string | null;
+};
+
 type IdeProgressTask = {
   id: string;
   kind: "indexing" | "build" | "sync";
@@ -112,6 +135,8 @@ type ServerMessage =
       configId?: string | null;
       executorId?: string | null;
     }
+  | VcsStatusMessage
+  | VcsOutputMessage
   | { type: "error"; message?: string; code?: string };
 
 const initialServerUrl = "ws://localhost:8765/ws";
@@ -132,6 +157,17 @@ const STORAGE_KEYS = {
 const formatPercent = (value: number | null | undefined) => {
   if (typeof value !== "number" || Number.isNaN(value)) return "0%";
   return `${Math.round(value * 100)}%`;
+};
+
+const formatVcsCommandLabel = (command: VcsCommand) => {
+  if (command === "rebase_main") return "rebase main";
+  return command;
+};
+
+const formatRootLabel = (root: string | null | undefined) => {
+  if (!root) return null;
+  const parts = root.split("/").filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : root;
 };
 
 export default function App() {
@@ -169,6 +205,9 @@ export default function App() {
   const [buildStatus, setBuildStatus] = useState<string>("idle");
   const [ideProgress, setIdeProgress] = useState<IdeProgressTask[]>([]);
   const [runConfigurations, setRunConfigurations] = useState<RunConfigurationItem[]>([]);
+  const [vcsBusy, setVcsBusy] = useState(false);
+  const [vcsStatus, setVcsStatus] = useState<VcsStatusMessage | null>(null);
+  const [commitMessage, setCommitMessage] = useState("");
   const [logs, setLogs] = useState<string[]>([]);
   const transcription = useAudioTranscription();
   const socketRef = useRef<WebSocket | null>(null);
@@ -300,7 +339,7 @@ export default function App() {
   };
 
   const appendOutputLines = (
-    source: "Build" | "Run",
+    source: "Build" | "Run" | "VCS",
     title: string | null | undefined,
     text: string,
     level: string | null | undefined,
@@ -336,7 +375,10 @@ export default function App() {
   };
 
   const logInbound = (message: ServerMessage) => {
-    if (message.type === "build_output" || message.type === "run_output") {
+    if (message.type === "build_output" || message.type === "run_output" || message.type === "vcs_output") {
+      return;
+    }
+    if (message.type === "vcs_status") {
       return;
     }
     if (message.type === "hello_ack") {
@@ -1491,6 +1533,35 @@ export default function App() {
             message.stream,
             message.projectName,
           );
+        } else if (message.type === "vcs_output") {
+          appendOutputLines(
+            "VCS",
+            formatVcsCommandLabel(message.command),
+            message.text,
+            message.stream ?? null,
+            formatRootLabel(message.root),
+          );
+        } else if (message.type === "vcs_status") {
+          setVcsStatus(message);
+          const nextBusy = message.status === "queued" || message.status === "started";
+          setVcsBusy(nextBusy);
+          const commandLabel = formatVcsCommandLabel(message.command);
+          if (message.status === "started") {
+            pushLog(`VCS ${commandLabel}: started`);
+          } else if (message.status === "queued") {
+            pushLog(`VCS ${commandLabel}: queued`);
+          } else if (message.status === "conflicts") {
+            const count = message.conflicts?.length ?? 0;
+            pushLog(`VCS ${commandLabel}: conflicts (${count})`);
+          } else if (message.status === "success") {
+            pushLog(`VCS ${commandLabel}: success`);
+          } else if (message.status === "failed") {
+            const detail = message.message ? ` (${message.message})` : "";
+            pushLog(`VCS ${commandLabel}: failed${detail}`);
+          }
+          if (message.message && message.status !== "failed") {
+            pushLog(`VCS ${commandLabel}: ${message.message}`);
+          }
         } else if (message.type === "terminal_error") {
           pushLog(`Terminal: ${message.message}`);
         } else if (message.type === "error") {
@@ -1517,6 +1588,8 @@ export default function App() {
       setSessionsLoaded(false);
       setRunConfigurations([]);
       setIdeProgress([]);
+      setVcsBusy(false);
+      setVcsStatus(null);
       const reason = event.reason ? `: ${event.reason}` : "";
       pushLog(`Socket disconnected (${event.code}${reason})`);
       if (wasConnecting && !connectionError) {
@@ -1558,6 +1631,8 @@ export default function App() {
     setRunConfigurations([]);
     setIdeProgress([]);
     setBuildStatus("idle");
+    setVcsBusy(false);
+    setVcsStatus(null);
   };
 
   const connectWithHistory = (item: ConnectionHistoryItem) => {
@@ -1669,6 +1744,26 @@ export default function App() {
     send({ type: "run_configuration", id });
   };
 
+  const sendVcsCommand = (command: VcsCommand, extra?: Record<string, unknown>) => {
+    if (connectionRef.current !== "connected") return;
+    send({ type: "vcs_command", command, ...(extra ?? {}) });
+  };
+  const commitChanges = () => {
+    const message = commitMessage.trim();
+    if (!message) return;
+    sendVcsCommand("commit", { message, stage: "all" });
+    setCommitMessage("");
+  };
+  const pullChanges = () => {
+    sendVcsCommand("pull");
+  };
+  const rebaseMain = () => {
+    sendVcsCommand("rebase_main");
+  };
+  const pushChanges = () => {
+    sendVcsCommand("push");
+  };
+
   const displaySessions = canInteract || showCachedContent ? sessions : [];
   const displayActiveSessionId = canInteract || showCachedContent ? activeSessionId : null;
   const activeOutput = displayActiveSessionId ? terminalOutputs[displayActiveSessionId] ?? "" : "";
@@ -1739,6 +1834,17 @@ export default function App() {
   const buildStatusLabel = buildStatusCount > 0 ? `running (${buildStatusCount})` : buildStatus;
   const hasBuildBadge = buildStatus === "started" || buildStatusCount > 0;
   const buildBadgeText = buildStatusCount > 9 ? "9+" : String(buildStatusCount);
+  const vcsStatusLabel = (() => {
+    if (!canInteract) return "Connect to manage VCS.";
+    if (!vcsStatus) return "Idle";
+    const label = formatVcsCommandLabel(vcsStatus.command);
+    if (vcsStatus.status === "queued") return `Queued: ${label}`;
+    if (vcsStatus.status === "started") return `Running: ${label}`;
+    if (vcsStatus.status === "success") return `Success: ${label}`;
+    if (vcsStatus.status === "conflicts") return `Conflicts: ${label}`;
+    if (vcsStatus.status === "failed") return `Failed: ${label}`;
+    return "Idle";
+  })();
   const sortedRunConfigurations = useMemo(() => {
     return [...runConfigurations].sort((a, b) => a.name.localeCompare(b.name));
   }, [runConfigurations]);
@@ -2447,6 +2553,76 @@ export default function App() {
                   ) : (
                     <Text style={styles.muted}>{runConfigEmptyMessage}</Text>
                   )}
+                </View>
+                <View style={styles.section}>
+                  <View style={styles.sectionHeader}>
+                    <Text style={styles.sectionTitle}>Version control</Text>
+                    <Text style={styles.sectionMeta}>{vcsStatusLabel}</Text>
+                  </View>
+                  <TextInput
+                    style={[styles.input, styles.commitInput]}
+                    value={commitMessage}
+                    onChangeText={setCommitMessage}
+                    placeholder="Commit message"
+                    placeholderTextColor="rgba(248, 250, 252, 0.4)"
+                    editable={canInteract && !vcsBusy}
+                    selectTextOnFocus={canInteract && !vcsBusy}
+                  />
+                  <View style={styles.buttonRow}>
+                    <Pressable
+                      style={[
+                        styles.button,
+                        styles.buttonPrimary,
+                        (!canInteract || vcsBusy || !commitMessage.trim()) && styles.buttonDisabled,
+                      ]}
+                      onPress={commitChanges}
+                      disabled={!canInteract || vcsBusy || !commitMessage.trim()}
+                    >
+                      <Text style={styles.buttonText}>Commit</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[
+                        styles.button,
+                        styles.buttonSecondary,
+                        (!canInteract || vcsBusy) && styles.buttonDisabled,
+                      ]}
+                      onPress={pullChanges}
+                      disabled={!canInteract || vcsBusy}
+                    >
+                      <Text style={styles.buttonText}>Pull</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[
+                        styles.button,
+                        styles.buttonSecondary,
+                        (!canInteract || vcsBusy) && styles.buttonDisabled,
+                      ]}
+                      onPress={rebaseMain}
+                      disabled={!canInteract || vcsBusy}
+                    >
+                      <Text style={styles.buttonText}>Rebase main</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[
+                        styles.button,
+                        styles.buttonSecondary,
+                        (!canInteract || vcsBusy) && styles.buttonDisabled,
+                      ]}
+                      onPress={pushChanges}
+                      disabled={!canInteract || vcsBusy}
+                    >
+                      <Text style={styles.buttonText}>Push</Text>
+                    </Pressable>
+                  </View>
+                  {vcsStatus?.message ? (
+                    <Text style={styles.muted}>{vcsStatus.message}</Text>
+                  ) : null}
+                  {vcsStatus?.conflicts && vcsStatus.conflicts.length > 0 ? (
+                    <Text style={styles.vcsConflictText}>
+                      Conflicts: {vcsStatus.conflicts.slice(0, 6).join(", ")}
+                      {vcsStatus.conflicts.length > 6 ? "…" : ""}
+                    </Text>
+                  ) : null}
                 </View>
               </View>
             ) : null}
@@ -3229,6 +3405,14 @@ const styles = StyleSheet.create({
   },
   commandInput: {
     flex: 1,
+  },
+  commitInput: {
+    marginTop: 6,
+  },
+  vcsConflictText: {
+    fontFamily: "SpaceGrotesk_500Medium",
+    color: THEME.colors.danger,
+    fontSize: 12,
   },
   micButton: {
     width: 44,

@@ -6,10 +6,8 @@ import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.util.Disposer
-import com.intellij.openapi.util.registry.Registry
 import com.intellij.terminal.JBTerminalWidget
 import com.intellij.terminal.ui.TerminalWidget
-import com.intellij.tunnel.settings.TunnelTerminalSettingsService
 import com.jediterm.core.Color
 import com.jediterm.terminal.Terminal
 import com.jediterm.terminal.TerminalColor
@@ -19,7 +17,6 @@ import com.jediterm.terminal.emulator.ColorPalette
 import com.jediterm.terminal.emulator.ColorPaletteImpl
 import com.jediterm.terminal.model.TerminalTextBuffer
 import com.jediterm.terminal.util.CharUtils
-import org.jetbrains.plugins.terminal.LocalBlockTerminalRunner
 import org.jetbrains.plugins.terminal.ShellTerminalWidget
 import org.jetbrains.plugins.terminal.TerminalToolWindowManager
 import java.awt.event.KeyEvent
@@ -303,30 +300,12 @@ class TerminalSessionManager {
         sessionId: String,
     ): ShellTerminalWidget {
         val terminalManager = TerminalToolWindowManager.getInstance(project)
-        val forceClassicTerminal = TunnelTerminalSettingsService.getInstance().isForceClassicTerminal()
-        val registry = Registry.get(LocalBlockTerminalRunner.BLOCK_TERMINAL_REGISTRY)
-        val wasBlockUiEnabled = registry.asBoolean()
-        val shouldDisableTemporarily = wasBlockUiEnabled && !forceClassicTerminal
-        if (wasBlockUiEnabled && forceClassicTerminal) {
-            logger.info("createSession: force classic terminal UI enabled id=$sessionId")
-            registry.setValue(false)
-        } else if (shouldDisableTemporarily) {
-            logger.info("createSession: disabling new terminal UI id=$sessionId")
-            registry.setValue(false)
-        }
-        try {
-            val terminalWidget = terminalManager.createShellWidget(workingDirectory, tabName, false, false)
-            logger.info("createSession: terminal widget class=${terminalWidget.javaClass.name} id=$sessionId")
-            return ShellTerminalWidget.asShellJediTermWidget(terminalWidget)
-                ?: throw IllegalStateException(
-                    "New Terminal UI is enabled. Disable 'terminal.new.ui' to create tunnel terminal sessions.",
-                )
-        } finally {
-            if (shouldDisableTemporarily) {
-                registry.setValue(true)
-                logger.info("createSession: restored new terminal UI flag id=$sessionId")
-            }
-        }
+        val terminalWidget = terminalManager.createShellWidget(workingDirectory, tabName, false, false)
+        logger.info("createSession: terminal widget class=${terminalWidget.javaClass.name} id=$sessionId")
+        return ShellTerminalWidget.asShellJediTermWidget(terminalWidget)
+            ?: throw IllegalStateException(
+                "New Terminal UI is enabled. Disable 'terminal.new.ui' to create tunnel terminal sessions.",
+            )
     }
 
     private fun syncExistingSessions() {

@@ -1,7 +1,6 @@
 package com.intellij.tunnel.settings
 
 import com.intellij.openapi.options.Configurable
-import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBPanel
 import com.intellij.util.ui.JBUI
@@ -10,9 +9,6 @@ import javax.swing.BoxLayout
 import javax.swing.JComponent
 
 class TunnelSettingsConfigurable : Configurable {
-    private val settingsService = TunnelTerminalSettingsService.getInstance()
-    private var forceClassicCheckBox: JBCheckBox? = null
-
     override fun getDisplayName(): String = "Tunnel"
 
     override fun createComponent(): JComponent {
@@ -21,34 +17,23 @@ class TunnelSettingsConfigurable : Configurable {
         content.layout = BoxLayout(content, BoxLayout.Y_AXIS)
         content.border = JBUI.Borders.empty(8, 12)
 
-        val checkBox = JBCheckBox("Force classic terminal UI for tunnel sessions")
-        val hint = JBLabel("Required to stream output; the new terminal UI has no readable buffer.")
-        hint.border = JBUI.Borders.emptyTop(4)
+        val title = JBLabel("Terminal output requires the classic UI.")
+        val hint = JBLabel("If sessions fail to start, disable 'terminal.new.ui' in the IDE registry.")
+        hint.border = JBUI.Borders.emptyTop(6)
 
-        content.add(checkBox)
+        content.add(title)
         content.add(hint)
         panel.add(content, BorderLayout.NORTH)
-
-        forceClassicCheckBox = checkBox
-        reset()
         return panel
     }
 
-    override fun isModified(): Boolean {
-        val checkBox = forceClassicCheckBox ?: return false
-        return checkBox.isSelected != settingsService.isForceClassicTerminal()
-    }
+    override fun isModified(): Boolean = false
 
     override fun apply() {
-        val checkBox = forceClassicCheckBox ?: return
-        settingsService.setForceClassicTerminal(checkBox.isSelected)
+        // No-op: settings panel is informational only.
     }
 
     override fun reset() {
-        forceClassicCheckBox?.isSelected = settingsService.isForceClassicTerminal()
-    }
-
-    override fun disposeUIResources() {
-        forceClassicCheckBox = null
+        // No-op.
     }
 }

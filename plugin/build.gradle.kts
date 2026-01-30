@@ -45,6 +45,11 @@ intellijPlatform {
             untilBuild = "261.*"
         }
     }
+    pluginVerification {
+        ides {
+            ide("IU", "261.17801.55")
+        }
+    }
 }
 
 kotlin {

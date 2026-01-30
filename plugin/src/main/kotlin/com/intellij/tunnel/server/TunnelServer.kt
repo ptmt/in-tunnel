@@ -30,8 +30,10 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.project.ProjectManagerListener
 import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.roots.ProjectRootManager
 import com.intellij.openapi.util.Computable
 import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.util.SystemInfo
 import com.intellij.task.ProjectTaskManager
 import com.intellij.tunnel.auth.TunnelAuthService
 import com.intellij.tunnel.terminal.TerminalSessionManager
@@ -57,6 +59,7 @@ import io.ktor.websocket.readText
 import io.ktor.websocket.send
 import java.net.BindException
 import java.time.Instant
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
@@ -67,6 +70,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.runBlocking
 import io.ktor.http.ContentType
 
@@ -103,6 +109,9 @@ class TunnelServer {
     private val buildLogContexts = ConcurrentHashMap<Project, ConcurrentHashMap<Any, BuildLogContext>>()
     @Volatile
     private var buildLogConnection: MessageBusConnection? = null
+    private val vcsQueue = Channel<VcsCommandRequest>(Channel.UNLIMITED)
+    @Volatile
+    private var vcsWorker: Job? = null
 
     val deviceRegistry = DeviceRegistry()
 
@@ -151,6 +160,33 @@ class TunnelServer {
         val shared: Boolean,
     )
 
+    private enum class VcsCommand(val wireName: String) {
+        COMMIT("commit"),
+        PULL("pull"),
+        REBASE_MAIN("rebase_main"),
+        PUSH("push");
+
+        companion object {
+            fun fromWire(value: String?): VcsCommand? {
+                if (value == null) return null
+                return entries.firstOrNull { it.wireName == value }
+            }
+        }
+    }
+
+    private data class VcsCommandRequest(
+        val id: String,
+        val command: VcsCommand,
+        val connectionId: String,
+        val payload: JsonObject,
+    )
+
+    private data class GitExecResult(
+        val exitCode: Int,
+        val stdout: List<String>,
+        val stderr: List<String>,
+    )
+
     fun start() {
         if (engine != null) return
         val candidate = createServer(port)
@@ -171,6 +207,7 @@ class TunnelServer {
         startProgressTracking()
         startExecutionTracking()
         startBuildLogTracking()
+        ensureVcsWorker()
         logger.info("Tunnel server started at ${serverInfo().wsUrl}")
     }
 
@@ -183,6 +220,8 @@ class TunnelServer {
         stopProgressTracking()
         stopExecutionTracking()
         stopBuildLogTracking()
+        vcsWorker?.cancel()
+        vcsWorker = null
         scope.cancel()
     }
 
@@ -779,6 +818,52 @@ class TunnelServer {
                     }
                     runConfigurationById(id, session, connectionId)
                 }
+                "vcs_command" -> {
+                    if (!ensureApproved(connectionId, session, context)) return
+                    val command = VcsCommand.fromWire(payload.stringValue("command"))
+                    if (command == null) {
+                        sendJson(
+                            session,
+                            mapOf(
+                                "type" to "vcs_status",
+                                "status" to "failed",
+                                "id" to "",
+                                "command" to (payload.stringValue("command") ?: "unknown"),
+                                "message" to "Unknown VCS command.",
+                            ),
+                            connectionId,
+                        )
+                        return
+                    }
+                    val requestId = UUID.randomUUID().toString()
+                    ensureVcsWorker()
+                    val accepted = vcsQueue.trySend(
+                        VcsCommandRequest(requestId, command, connectionId, payload)
+                    ).isSuccess
+                    if (!accepted) {
+                        sendJson(
+                            session,
+                            mapOf(
+                                "type" to "vcs_status",
+                                "status" to "failed",
+                                "id" to requestId,
+                                "command" to command.wireName,
+                                "message" to "Failed to queue VCS command.",
+                            ),
+                            connectionId,
+                        )
+                        return
+                    }
+                    broadcastVcsStatus(
+                        requestId,
+                        command,
+                        status = "queued",
+                        message = "Queued",
+                        roots = emptyList(),
+                        conflicts = emptyList(),
+                        durationMs = null,
+                    )
+                }
                 else -> {
                     sendJson(session, mapOf("type" to "error", "message" to "Unknown message type: $type"), connectionId)
                 }
@@ -1144,6 +1229,340 @@ class TunnelServer {
             }
     }
 
+    private fun ensureVcsWorker() {
+        val existing = vcsWorker
+        if (existing?.isActive == true) return
+        vcsWorker = scope.launch {
+            for (request in vcsQueue) {
+                try {
+                    processVcsCommand(request)
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    logger.warn("VCS command failed: ${request.command.wireName}", error)
+                    broadcastVcsStatus(
+                        request.id,
+                        request.command,
+                        status = "failed",
+                        message = error.message ?: "VCS command failed",
+                        roots = emptyList(),
+                        conflicts = emptyList(),
+                        durationMs = null,
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun processVcsCommand(request: VcsCommandRequest) {
+        val startedAt = System.currentTimeMillis()
+        broadcastVcsStatus(
+            request.id,
+            request.command,
+            status = "started",
+            message = "Running ${request.command.wireName}",
+            roots = emptyList(),
+            conflicts = emptyList(),
+            durationMs = null,
+        )
+        val project = ProjectManager.getInstance().openProjects.firstOrNull()
+        if (project == null) {
+            broadcastVcsStatus(
+                request.id,
+                request.command,
+                status = "failed",
+                message = "No open project",
+                roots = emptyList(),
+                conflicts = emptyList(),
+                durationMs = null,
+            )
+            return
+        }
+
+        val roots = resolveGitRoots(project)
+        if (roots.isEmpty()) {
+            broadcastVcsStatus(
+                request.id,
+                request.command,
+                status = "failed",
+                message = "No Git repository found",
+                roots = emptyList(),
+                conflicts = emptyList(),
+                durationMs = null,
+            )
+            return
+        }
+
+        val preExistingConflicts = collectConflicts(roots)
+        if (preExistingConflicts.isNotEmpty()) {
+            broadcastVcsStatus(
+                request.id,
+                request.command,
+                status = "conflicts",
+                message = "Resolve existing conflicts before running VCS commands.",
+                roots = roots,
+                conflicts = preExistingConflicts,
+                durationMs = System.currentTimeMillis() - startedAt,
+            )
+            return
+        }
+
+        val errors = mutableListOf<String>()
+        when (request.command) {
+            VcsCommand.COMMIT -> {
+                val message = request.payload.stringValue("message")?.trim().orEmpty()
+                if (message.isBlank()) {
+                    errors.add("Commit message is required.")
+                } else {
+                    val stage = request.payload.stringValue("stage")?.trim()?.lowercase()
+                    val stageAll = stage.isNullOrBlank() || stage == "all"
+                    roots.forEach { root ->
+                        val rootLabel = root.name
+                        val statusResult = execGit(root, listOf("status", "--porcelain"), null)
+                        if (statusResult.exitCode != 0) {
+                            errors.add("$rootLabel: failed to read status")
+                            emitCommandOutput(request, root, "stderr", statusResult.stderr)
+                            return@forEach
+                        }
+                        if (statusResult.stdout.isEmpty()) {
+                            errors.add("$rootLabel: no changes to commit")
+                            return@forEach
+                        }
+                        if (stageAll) {
+                            val addResult = execGit(root, listOf("add", "-A"), null)
+                            if (addResult.exitCode != 0) {
+                                errors.add("$rootLabel: failed to stage changes")
+                                emitCommandOutput(request, root, "stderr", addResult.stderr)
+                                return@forEach
+                            }
+                            emitCommandOutput(request, root, "stdout", addResult.stdout)
+                            emitCommandOutput(request, root, "stderr", addResult.stderr)
+                        }
+                        val commitResult = execGit(
+                            root,
+                            listOf("commit", "-m", message),
+                            null,
+                        )
+                        emitCommandOutput(request, root, "stdout", commitResult.stdout)
+                        emitCommandOutput(request, root, "stderr", commitResult.stderr)
+                        if (commitResult.exitCode != 0) {
+                            errors.add("$rootLabel: commit failed")
+                        }
+                    }
+                }
+            }
+            VcsCommand.PULL -> {
+                roots.forEach { root ->
+                    val rootLabel = root.name
+                    val pullResult = execGit(root, listOf("pull"), null)
+                    emitCommandOutput(request, root, "stdout", pullResult.stdout)
+                    emitCommandOutput(request, root, "stderr", pullResult.stderr)
+                    if (pullResult.exitCode != 0) {
+                        errors.add("$rootLabel: pull failed")
+                    }
+                }
+            }
+            VcsCommand.REBASE_MAIN -> {
+                val remote = request.payload.stringValue("remote")?.trim().orEmpty().ifBlank { "origin" }
+                val branch = request.payload.stringValue("branch")?.trim().orEmpty().ifBlank { "main" }
+                roots.forEach { root ->
+                    val rootLabel = root.name
+                    val fetchResult = execGit(root, listOf("fetch", remote, branch), null)
+                    emitCommandOutput(request, root, "stdout", fetchResult.stdout)
+                    emitCommandOutput(request, root, "stderr", fetchResult.stderr)
+                    if (fetchResult.exitCode != 0) {
+                        errors.add("$rootLabel: fetch failed")
+                        return@forEach
+                    }
+                    val rebaseTarget = "$remote/$branch"
+                    val rebaseResult = execGit(root, listOf("rebase", "--autostash", rebaseTarget), null)
+                    emitCommandOutput(request, root, "stdout", rebaseResult.stdout)
+                    emitCommandOutput(request, root, "stderr", rebaseResult.stderr)
+                    if (rebaseResult.exitCode != 0) {
+                        errors.add("$rootLabel: rebase failed")
+                    }
+                }
+            }
+            VcsCommand.PUSH -> {
+                roots.forEach { root ->
+                    val rootLabel = root.name
+                    val pushResult = execGit(root, listOf("push"), null)
+                    emitCommandOutput(request, root, "stdout", pushResult.stdout)
+                    emitCommandOutput(request, root, "stderr", pushResult.stderr)
+                    if (pushResult.exitCode != 0) {
+                        errors.add("$rootLabel: push failed")
+                    }
+                }
+            }
+        }
+
+        val conflicts = collectConflicts(roots)
+
+        val durationMs = System.currentTimeMillis() - startedAt
+        val status = when {
+            conflicts.isNotEmpty() -> "conflicts"
+            errors.isNotEmpty() -> "failed"
+            else -> "success"
+        }
+        val message = when {
+            conflicts.isNotEmpty() -> "Conflicts detected. Resolve in IDE and continue rebase/merge."
+            errors.isNotEmpty() -> errors.joinToString("; ")
+            else -> "Completed"
+        }
+        broadcastVcsStatus(
+            request.id,
+            request.command,
+            status = status,
+            message = message,
+            roots = roots,
+            conflicts = conflicts,
+            durationMs = durationMs,
+        )
+    }
+
+    private fun broadcastVcsStatus(
+        id: String,
+        command: VcsCommand,
+        status: String,
+        message: String?,
+        roots: List<File>,
+        conflicts: List<String>,
+        durationMs: Long?,
+    ) {
+        val payload = mutableMapOf<String, Any>(
+            "type" to "vcs_status",
+            "id" to id,
+            "command" to command.wireName,
+            "status" to status,
+        )
+        if (!message.isNullOrBlank()) {
+            payload["message"] = message
+        }
+        if (roots.isNotEmpty()) {
+            payload["roots"] = roots.map { it.path }
+        }
+        if (conflicts.isNotEmpty()) {
+            payload["conflicts"] = conflicts
+        }
+        if (durationMs != null) {
+            payload["durationMs"] = durationMs
+        }
+        broadcast(payload)
+    }
+
+    private fun emitCommandOutput(
+        request: VcsCommandRequest,
+        root: File?,
+        stream: String,
+        lines: List<String>,
+    ) {
+        if (lines.isEmpty()) return
+        val text = lines.joinToString("\n")
+        broadcast(
+            mapOf(
+                "type" to "vcs_output",
+                "id" to request.id,
+                "command" to request.command.wireName,
+                "stream" to stream,
+                "text" to text,
+                "root" to root?.path,
+            )
+        )
+    }
+
+    private suspend fun resolveGitRoots(project: Project): List<File> {
+        val candidates = mutableListOf<File>()
+        project.basePath?.let { candidates.add(File(it)) }
+        val contentRoots = ApplicationManager.getApplication().runReadAction<List<String>> {
+            ProjectRootManager.getInstance(project).contentRoots.map { it.path }
+        }
+        contentRoots.forEach { path ->
+            candidates.add(File(path))
+        }
+        val roots = LinkedHashSet<File>()
+        for (candidate in candidates) {
+            val root = discoverGitRoot(candidate) ?: continue
+            roots.add(root)
+        }
+        return roots.toList()
+    }
+
+    private suspend fun collectConflicts(roots: List<File>): List<String> {
+        val conflicts = mutableListOf<String>()
+        roots.forEach { root ->
+            val rootLabel = root.name
+            val conflictResult = execGit(root, listOf("diff", "--name-only", "--diff-filter=U"), null)
+            if (conflictResult.exitCode == 0) {
+                conflictResult.stdout
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .forEach { conflicts.add("$rootLabel/$it") }
+            }
+        }
+        return conflicts
+    }
+
+    private suspend fun discoverGitRoot(dir: File): File? {
+        if (!dir.exists()) return null
+        val result = execGit(dir, listOf("rev-parse", "--show-toplevel"), null)
+        if (result.exitCode != 0) return null
+        val path = result.stdout.firstOrNull()?.trim().orEmpty()
+        if (path.isBlank()) return null
+        return File(path)
+    }
+
+    private suspend fun execGit(
+        root: File,
+        args: List<String>,
+        onOutput: ((stream: String, line: String) -> Unit)? = null,
+    ): GitExecResult = withContext(Dispatchers.IO) {
+        val command = mutableListOf("git")
+        command.addAll(args)
+        val process = ProcessBuilder(command)
+            .directory(root)
+            .redirectErrorStream(false)
+            .apply {
+                val env = environment()
+                applyGitNonInteractiveEnv(env)
+            }
+            .start()
+
+        val stdout = mutableListOf<String>()
+        val stderr = mutableListOf<String>()
+        coroutineScope {
+            val stdoutJob = launch {
+                process.inputStream.bufferedReader().useLines { lines ->
+                    lines.forEach { line ->
+                        stdout.add(line)
+                        onOutput?.invoke("stdout", line)
+                    }
+                }
+            }
+            val stderrJob = launch {
+                process.errorStream.bufferedReader().useLines { lines ->
+                    lines.forEach { line ->
+                        stderr.add(line)
+                        onOutput?.invoke("stderr", line)
+                    }
+                }
+            }
+            val exitCode = process.waitFor()
+            stdoutJob.join()
+            stderrJob.join()
+            GitExecResult(exitCode, stdout, stderr)
+        }
+    }
+
+    private fun applyGitNonInteractiveEnv(env: MutableMap<String, String>) {
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        if (SystemInfo.isWindows) {
+            env["GIT_EDITOR"] = "cmd.exe /c exit 0"
+            env["GIT_SEQUENCE_EDITOR"] = "cmd.exe /c exit 0"
+        } else {
+            env["GIT_EDITOR"] = ":"
+            env["GIT_SEQUENCE_EDITOR"] = ":"
+        }
+    }
+
     private fun broadcast(message: Any) {
         val text = gson.toJson(message)
         scope.launch {
@@ -1184,5 +1603,9 @@ class TunnelServer {
             "workingDirectory" to session.workingDirectory,
             "createdAt" to session.createdAt.toString(),
         )
+    }
+
+    private fun JsonObject.stringValue(key: String): String? {
+        return runCatching { get(key)?.asString }.getOrNull()
     }
 }

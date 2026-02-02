@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Plugin version (e.g. 1.2.3). Overrides release tag when provided."
+        description: "Base plugin version to bump (e.g. 1.2.3 -> 1.2.4). Overrides release tag when provided."
         required: false
         type: string
 
@@ -16,22 +16,6 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Resolve version
-        id: version
-        shell: bash
-        run: |
-          VERSION_INPUT="${{ inputs.version }}"
-          TAG_NAME="${{ github.event.release.tag_name }}"
-          if [ -n "$TAG_NAME" ]; then
-            VERSION="$TAG_NAME"
-          elif [ -n "$VERSION_INPUT" ]; then
-            VERSION="$VERSION_INPUT"
-          else
-            echo "Version is required (release tag or workflow input)." >&2
-            exit 1
-          fi
-          VERSION="${VERSION#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       - name: Resolve build ref
         id: build_ref
         shell: bash
@@ -48,6 +32,49 @@ jobs:
           ref: ${{ steps.build_ref.outputs.ref }}
           fetch-depth: 0
           path: release-src
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          VERSION_INPUT="${{ inputs.version }}"
+          TAG_NAME="${{ github.event.release.tag_name }}"
+          if [ -n "$TAG_NAME" ]; then
+            BASE_VERSION="$TAG_NAME"
+          elif [ -n "$VERSION_INPUT" ]; then
+            BASE_VERSION="$VERSION_INPUT"
+          else
+            BASE_VERSION="$(python - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("release-src/plugin/build.gradle.kts")
+          text = path.read_text()
+          match = re.search(r'^\\s*version\\s*=\\s*"([^"]+)"', text, flags=re.M)
+          if not match:
+              raise SystemExit("Version is required (release tag, workflow input, or build.gradle.kts).")
+          print(match.group(1))
+          PY
+            )"
+          fi
+          BASE_VERSION="${BASE_VERSION#v}"
+          if [ -z "$BASE_VERSION" ]; then
+            echo "Base version is required (release tag, workflow input, or build.gradle.kts)." >&2
+            exit 1
+          fi
+          export BASE_VERSION
+          VERSION="$(python - <<'PY'
+          import os
+          import re
+
+          base = os.environ["BASE_VERSION"].strip()
+          match = re.match(r'^(\\d+)\\.(\\d+)\\.(\\d+)(?:[.-].*)?$', base)
+          if not match:
+              raise SystemExit(f"Base version must look like X.Y.Z, got: {base}")
+          major, minor, patch = (int(part) for part in match.groups())
+          print(f"{major}.{minor}.{patch + 1}")
+          PY
+          )"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       - name: Checkout default branch
         uses: actions/checkout@v5
         with:

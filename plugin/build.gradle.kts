@@ -3,8 +3,10 @@ plugins {
     id("org.jetbrains.intellij.platform") version "2.10.5"
 }
 
+val pluginVersion: String by project
+
 group = "com.potomushto.intunnel"
-version = "0.1.0"
+version = pluginVersion
 
 repositories {
     mavenCentral()

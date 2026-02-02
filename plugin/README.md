@@ -2,7 +2,7 @@
 
 ## Release build and Marketplace distribution
 
-- Update `version` in `build.gradle.kts` and confirm the `sinceBuild`/`untilBuild` range.
+- Update `pluginVersion` in `gradle.properties` and confirm the `sinceBuild`/`untilBuild` range.
 - Build the release artifact with `./gradlew buildPlugin` (ZIP goes to `build/distributions`).
 - Optional: run `./gradlew verifyPlugin` before signing/publishing.
 - Configure signing and publishing credentials (example below) and keep secrets in env vars:

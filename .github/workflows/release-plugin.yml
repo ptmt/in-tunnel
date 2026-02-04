@@ -16,7 +16,9 @@ jobs:
         shell: bash
         run: |
           TAG_NAME="${{ github.event.release.tag_name }}"
-          if [ -n "$TAG_NAME" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ref=${{ github.ref }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "$TAG_NAME" ]; then
             echo "ref=$TAG_NAME" >> "$GITHUB_OUTPUT"
           else
             echo "ref=${{ github.event.repository.default_branch }}" >> "$GITHUB_OUTPUT"

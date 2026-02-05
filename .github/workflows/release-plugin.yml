@@ -59,20 +59,24 @@ jobs:
 
           path = Path("release-src/plugin/gradle.properties")
           if not path.exists():
-              raise SystemExit(f"Version is required (release tag, workflow input, or missing {path}).")
+              raise SystemExit(
+                  f"Version is required (release tag, workflow input, or missing {path})."
+              )
           text = path.read_text(encoding="utf-8")
           if text.startswith("\\ufeff"):
               text = text.lstrip("\\ufeff")
           match = re.search(r'^\\s*pluginVersion\\s*=\\s*([^\\s#]+)', text, flags=re.M)
           if not match:
-              raise SystemExit(f"Version is required (release tag, workflow input, or {path}).")
+              raise SystemExit(
+                  "Version is required (release tag, workflow input, or plugin/gradle.properties)."
+              )
           print(match.group(1))
           PY
             )"
           fi
           BASE_VERSION="${BASE_VERSION#v}"
           if [ -z "$BASE_VERSION" ]; then
-            echo "Base version is required (release tag, workflow input, or gradle.properties)." >&2
+            echo "Base version is required (release tag, workflow input, or plugin/gradle.properties)." >&2
             exit 1
           fi
           export BASE_VERSION

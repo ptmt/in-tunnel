@@ -39,6 +39,27 @@ jobs:
           ref: ${{ steps.build_ref.outputs.ref }}
           fetch-depth: 0
           path: release-src
+      - name: Debug release source
+        shell: bash
+        run: |
+          echo "PWD: $(pwd)"
+          echo "Contents of workspace:"
+          ls -la
+          echo "Contents of release-src:"
+          ls -la release-src || true
+          echo "Contents of release-src/plugin:"
+          ls -la release-src/plugin || true
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("release-src/plugin/gradle.properties")
+          print(f"gradle.properties exists: {path.exists()}")
+          if path.exists():
+              data = path.read_bytes()
+              print(f"gradle.properties size: {len(data)} bytes")
+              print("First 200 bytes repr:")
+              print(repr(data[:200]))
+          PY
       - name: Resolve version
         id: version
         shell: bash

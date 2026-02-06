@@ -1,5 +1,3 @@
-import org.gradle.jvm.tasks.Jar
-
 plugins {
     kotlin("jvm") version "2.3.0"
     id("org.jetbrains.intellij.platform") version "2.10.5"
@@ -52,54 +50,6 @@ intellijPlatform {
     pluginVerification {
         ides {
             ide("IU", "261.17801.55")
-        }
-    }
-}
-
-fun sanitizeManifestFile(manifestFile: File) {
-    if (!manifestFile.exists()) {
-        return
-    }
-    val original = manifestFile.readText()
-    if (original.isEmpty()) {
-        return
-    }
-    var sanitized = original
-    if (sanitized.startsWith("\uFEFF")) {
-        sanitized = sanitized.removePrefix("\uFEFF")
-    }
-    sanitized = sanitized.replaceFirst(Regex("^\\s+"), "")
-    if (sanitized == original) {
-        return
-    }
-    manifestFile.writeText(sanitized)
-}
-
-fun debugManifestFile(manifestFile: File, label: String) {
-    if (!manifestFile.exists()) {
-        return
-    }
-    val data = manifestFile.readBytes()
-    val preview = data.take(200).toByteArray().contentToString()
-    println("MANIFEST_DEBUG [$label] ${manifestFile.absolutePath} size=${data.size} bytes preview=$preview")
-}
-
-tasks.withType<Jar>().configureEach {
-    doFirst {
-        val manifestPaths = listOf(
-            "tmp/generateManifest/MANIFEST.MF",
-            "tmp/jar/MANIFEST.MF",
-            "tmp/instrumentedJar/MANIFEST.MF",
-            "tmp/composedJar/MANIFEST.MF",
-            "tmp/jarSearchableOptions/MANIFEST.MF",
-        )
-        val debug = System.getenv("MANIFEST_DEBUG") == "1"
-        for (relativePath in manifestPaths) {
-            val manifestFile = layout.buildDirectory.file(relativePath).get().asFile
-            if (debug) {
-                debugManifestFile(manifestFile, relativePath)
-            }
-            sanitizeManifestFile(manifestFile)
         }
     }
 }

@@ -69,7 +69,7 @@ jobs:
           text = path.read_text() if path.exists() else ""
           updated, count = re.subn(r'^(\\s*pluginVersion\\s*=\\s*)([^\\s#]+)', r'\\1' + version, text, flags=re.M)
           if count == 0:
-              updated = f"pluginVersion={version}\\n{text}"
+              updated = f"pluginVersion={version}\n{text}"
               count = 1
           if count != 1:
               raise SystemExit(f"Expected to update 1 version line, updated {count}")
@@ -92,7 +92,7 @@ jobs:
           text = path.read_text() if path.exists() else ""
           updated, count = re.subn(r'^(\\s*pluginVersion\\s*=\\s*)([^\\s#]+)', r'\\1' + version, text, flags=re.M)
           if count == 0:
-              updated = f"pluginVersion={version}\\n{text}"
+              updated = f"pluginVersion={version}\n{text}"
               count = 1
           if count != 1:
               raise SystemExit(f"Expected to update 1 version line, updated {count}")
@@ -123,8 +123,6 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
       - name: Build plugin
         working-directory: release-src/plugin
-        env:
-          MANIFEST_DEBUG: "1"
         run: |
           chmod +x ./gradlew
           ./gradlew buildPlugin

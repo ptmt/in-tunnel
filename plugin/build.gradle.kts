@@ -60,21 +60,27 @@ fun sanitizeManifestFile(manifestFile: File) {
     if (!manifestFile.exists()) {
         return
     }
-    val lines = manifestFile.readLines()
-    val firstNonEmpty = lines.firstOrNull { it.isNotBlank() } ?: return
-    if (!firstNonEmpty.startsWith(" ")) {
+    val original = manifestFile.readText()
+    if (original.isEmpty()) {
         return
     }
-    val fixed = lines.map { line ->
-        if (line.startsWith(" ")) line.drop(1) else line
+    var sanitized = original
+    if (sanitized.startsWith("\uFEFF")) {
+        sanitized = sanitized.removePrefix("\uFEFF")
     }
-    manifestFile.writeText(fixed.joinToString("\n") + "\n")
+    sanitized = sanitized.replaceFirst(Regex("^\\s+"), "")
+    if (sanitized == original) {
+        return
+    }
+    manifestFile.writeText(sanitized)
 }
 
 tasks.withType<Jar>().configureEach {
     doFirst {
-        val manifestFile = layout.buildDirectory.file("tmp/generateManifest/MANIFEST.MF").get().asFile
-        sanitizeManifestFile(manifestFile)
+        val generatedManifest = layout.buildDirectory.file("tmp/generateManifest/MANIFEST.MF").get().asFile
+        sanitizeManifestFile(generatedManifest)
+        val jarManifest = layout.buildDirectory.file("tmp/jar/MANIFEST.MF").get().asFile
+        sanitizeManifestFile(jarManifest)
     }
 }
 

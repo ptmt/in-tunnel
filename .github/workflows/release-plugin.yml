@@ -67,12 +67,9 @@ jobs:
           version = os.environ["PLUGIN_VERSION"]
           path = Path(os.environ["TARGET_DIR"]) / "plugin/gradle.properties"
           text = path.read_text() if path.exists() else ""
-          updated, count = re.subn(r'^(\\s*pluginVersion\\s*=\\s*)([^\\s#]+)', r'\\1' + version, text, flags=re.M)
-          if count == 0:
-              updated = f"pluginVersion={version}\n{text}"
-              count = 1
-          if count != 1:
-              raise SystemExit(f"Expected to update 1 version line, updated {count}")
+          # Remove all existing pluginVersion lines and insert the new one
+          cleaned = re.sub(r'^\s*pluginVersion\s*=\s*[^\n]*\n?', '', text, flags=re.M)
+          updated = f"pluginVersion={version}\n{cleaned}"
           if updated != text or not path.exists():
               path.write_text(updated)
           PY
@@ -90,12 +87,9 @@ jobs:
           version = os.environ["PLUGIN_VERSION"]
           path = Path(os.environ["TARGET_DIR"]) / "plugin/gradle.properties"
           text = path.read_text() if path.exists() else ""
-          updated, count = re.subn(r'^(\\s*pluginVersion\\s*=\\s*)([^\\s#]+)', r'\\1' + version, text, flags=re.M)
-          if count == 0:
-              updated = f"pluginVersion={version}\n{text}"
-              count = 1
-          if count != 1:
-              raise SystemExit(f"Expected to update 1 version line, updated {count}")
+          # Remove all existing pluginVersion lines and insert the new one
+          cleaned = re.sub(r'^\s*pluginVersion\s*=\s*[^\n]*\n?', '', text, flags=re.M)
+          updated = f"pluginVersion={version}\n{cleaned}"
           if updated != text or not path.exists():
               path.write_text(updated)
           PY
@@ -112,7 +106,7 @@ jobs:
           git -C repo config user.name "github-actions[bot]"
           git -C repo config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C repo add plugin/gradle.properties
-          git -C repo commit -m "chore: bump plugin version to ${{ steps.version.outputs.version }}"
+          git -C repo commit -m "chore: bump plugin version to ${{ steps.version.outputs.version }} [skip ci]"
           git -C repo push origin HEAD:${{ github.event.repository.default_branch }}
       - name: Setup Java
         uses: actions/setup-java@v5

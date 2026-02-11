@@ -5,6 +5,7 @@ on:
 jobs:
   update:
     name: Update
+    if: ${{ contains(github.commit_message || '', '[ios]') }}
     type: update
     params:
       branch: ${{ github.ref_name || 'test' }}

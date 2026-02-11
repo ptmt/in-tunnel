@@ -4,6 +4,7 @@ on:
 jobs:
   build_ios:
     name: Build iOS app
+    if: ${{ contains(github.commit_message || '', '[ios]') }}
     type: build
     params:
       platform: ios
